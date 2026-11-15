@@ -1,5 +1,5 @@
 // ツボ記録：オフライン用のキャッシュ（src/build.py が生成）
-const CACHE = 'tsubo-kiroku-69bc9f271415';
+const CACHE = 'tsubo-kiroku-7d4acadbf47b';
 const ASSETS = ["./", "index.html", "app.js", "store.js", "stats.js", "manifest.webmanifest", "icons/icon-180.png", "icons/icon-192.png", "icons/icon-512.png"];
 self.addEventListener('install', e => {
   // ブラウザが手元に持っている古い写しは使わず、必ず公開先から取り直す

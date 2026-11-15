@@ -2,14 +2,14 @@
 import { openStore } from './store.js';
 import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 
-const VERSION = '1.0';
+const VERSION = '1.1';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
 const sideLabel = v => (SIDES.find(s => s.v === (v || '')) || SIDES[3]).label;
 
 let store;
-const db = { patients: new Map(), visits: new Map(), tsubo: new Map(), symptoms: new Map(), meta: new Map() };
+const db = { patients: new Map(), visits: new Map(), tsubo: new Map(), symptoms: new Map(), places: new Map(), meta: new Map() };
 
 /* ---------- 小さな道具 ---------- */
 const $ = s => document.querySelector(s);
@@ -63,11 +63,16 @@ function visitsByPatient() {
   for (const l of m.values()) l.sort(visitOrder);
   return m;
 }
-const patientName = p => (p ? `No.${p.no}${p.label ? '　' + p.label : ''}` : '（患者が見つかりません）');
+// 名前で管理する場所の患者は名前、番号で管理する場所の患者は「No.〜」で表す
+const patientName = p => (!p ? '（患者が見つかりません）' : p.name ? p.name : `No.${p.no || ''}${p.label ? '　' + p.label : ''}`);
 const tsuboName = id => (db.tsubo.get(id) || { name: '（消したツボ）' }).name;
 const symptomName = id => (id == null ? '症状を選んでいない記録' : (db.symptoms.get(id) || { name: '（消した症状）' }).name);
 const activeTsubo = () => [...db.tsubo.values()].filter(t => !t.archived);
 const activeSymptoms = () => [...db.symptoms.values()].filter(s => !s.archived);
+// 場所（治療院・病院など）。患者は、どこか1つの場所に属する。場所の決まっていない患者（場所ができる前の記録）は、最初の場所に属するものとして扱う
+const places = () => [...db.places.values()].sort((a, b) => a.created - b.created);
+const placeOf = p => (db.places.has(p.placeId) ? p.placeId : places()[0].id);
+const curPlace = () => db.places.get(metaGet('place')) || places()[0];
 // 来院の中の症状が変わったら、ツボの行がさす症状をそろえる
 function fixRows(v) {
   for (const r of v.rows) if (!v.symptoms.includes(r.symptomId)) r.symptomId = v.symptoms[0] || null;
@@ -131,55 +136,75 @@ const topbar = (title, back, sub, right) => h('div', { class: 'top' },
 let patientQuery = '';
 function viewPatients() {
   const idx = visitsByPatient();
+  const place = curPlace();
+  const mine = [...db.patients.values()].filter(p => placeOf(p) === place.id);
   const listEl = h('ul', { class: 'list' });
   const draw = () => {
     const q = norm(patientQuery);
-    const rows = [...db.patients.values()]
+    const rows = mine
       .map(p => { const vs = idx.get(p.id) || []; const last = vs[vs.length - 1]; return { p, vs, last, key: last ? last.date : ymd(new Date(p.created)) }; })
-      .filter(x => !q || norm(x.p.no).includes(q) || norm(x.p.label).includes(q))
+      .filter(x => !q || [x.p.no, x.p.label, x.p.name, x.p.yomi].some(s => norm(s).includes(q)))
       .sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : b.p.created - a.p.created));
     listEl.replaceChildren(...rows.map(({ p, vs, last }) => h('li', null, h('button', { class: 'item', onclick: () => go('#/p/' + p.id) },
       h('span', { class: 'ttl' }, patientName(p)),
       h('span', { class: 'sub' }, last ? `最終 ${fmtDate(last.date)}・${vs.length}回${last.symptoms.length ? '・' + last.symptoms.map(symptomName).join('、') : ''}` : 'まだ記録がありません')))));
-    if (!rows.length) listEl.append(h('li', { class: 'empty' }, db.patients.size ? '当てはまる患者がいません。' : 'まず「患者を追加」から、カルテの番号を登録してください。'));
+    if (!rows.length) listEl.append(h('li', { class: 'empty' }, mine.length ? '当てはまる患者がいません。' : place.mode === 'name' ? 'まず「患者を追加」から、患者の名前を登録してください。' : 'まず「患者を追加」から、カルテの番号を登録してください。'));
   };
   draw();
   const lastBackup = metaGet('lastBackup');
   const stale = db.visits.size >= 5 && (!lastBackup || Date.now() - lastBackup > 30 * 864e5);
   return [
     topbar('ツボ記録', null, null, h('button', { class: 'btn primary', onclick: () => editPatient(null) }, '＋ 患者を追加')),
-    db.patients.size > 5 ? h('input', { type: 'search', placeholder: '番号・呼び名でさがす', value: patientQuery, oninput: e => { patientQuery = e.target.value; draw(); } }) : null,
+    h('div', { class: 'chips' },
+      places().map(pl => h('button', { class: 'chip', 'aria-pressed': String(pl.id === place.id), onclick: async () => { patientQuery = ''; await metaSet('place', pl.id); render(); } }, pl.name)),
+      h('button', { class: 'chip', style: 'color:var(--sub)', onclick: () => editPlace(null) }, '＋ 場所')),
+    mine.length > 5 ? h('input', { type: 'search', placeholder: place.mode === 'name' ? '名前・よみでさがす' : '番号・呼び名でさがす', value: patientQuery, oninput: e => { patientQuery = e.target.value; draw(); } }) : null,
     stale ? h('button', { class: 'item', onclick: () => go('#/settings') }, h('span', { class: 'sub' }, lastBackup ? '控えを取ってから1か月以上たっています。「控え」から書き出しておくと安心です。' : 'まだ控えを取っていません。「控え」から書き出しておくと安心です。')) : null,
     listEl,
   ];
 }
-function nextPatientNo() {
+function nextPatientNo(placeId) {
   let max = 0;
-  for (const p of db.patients.values()) { const n = parseInt(norm(p.no), 10); if (n > max) max = n; }
+  for (const p of db.patients.values()) {
+    if (placeOf(p) !== placeId) continue; const n = parseInt(norm(p.no), 10); if (n > max) max = n; }
   return String(max + 1);
 }
 function editPatient(p) {
   const isNew = !p;
-  const no = h('input', { type: 'text', value: isNew ? nextPatientNo() : p.no, inputMode: 'numeric', autocomplete: 'off' });
+  const place = isNew ? curPlace() : db.places.get(placeOf(p));
+  const nameMode = place.mode === 'name';
+  const no = h('input', { type: 'text', value: isNew ? nextPatientNo(place.id) : p.no || '', inputMode: 'numeric', autocomplete: 'off' });
   const label = h('input', { type: 'text', value: isNew ? '' : p.label || '', placeholder: 'イニシャルなど（空欄でもよい）', autocomplete: 'off' });
+  const name = h('input', { type: 'text', value: isNew ? '' : p.name || '', placeholder: '例：山田 花子', autocomplete: 'off' });
+  const yomi = h('input', { type: 'text', value: isNew ? '' : p.yomi || '', placeholder: 'ひらがな（さがすときに使います。空欄でもよい）', autocomplete: 'off' });
   const memo = h('textarea', { value: isNew ? '' : p.memo || '', placeholder: '主訴の覚え書きなど' });
   const save = async () => {
-    const v = no.value.trim();
-    if (!v) { toast('番号を入れてください'); return; }
-    if ([...db.patients.values()].some(x => x.no === v && (isNew || x.id !== p.id))) { toast(`No.${v} はすでに登録されています`); return; }
+    const others = [...db.patients.values()].filter(x => placeOf(x) === place.id && (isNew || x.id !== p.id));
     const obj = isNew ? { id: uid(), created: Date.now() } : p;
-    Object.assign(obj, { no: v, label: label.value.trim(), memo: memo.value.trim() });
+    if (nameMode) {
+      const v = name.value.trim().replace(/\s+/g, ' ');
+      if (!v) { toast('名前を入れてください'); return; }
+      if (others.some(x => x.name === v)) { toast(`「${v}」はすでに登録されています。同じ名前の方は、名前のあとに印を付けて区別してください`); return; }
+      Object.assign(obj, { name: v, yomi: yomi.value.trim() });
+    } else {
+      const v = no.value.trim();
+      if (!v) { toast('番号を入れてください'); return; }
+      if (others.some(x => x.no === v)) { toast(`No.${v} はすでに登録されています`); return; }
+      Object.assign(obj, { no: v, label: label.value.trim() });
+    }
+    Object.assign(obj, { placeId: place.id, memo: memo.value.trim() });
     await put('patients', obj);
     saved = obj.id; dlg.close();
   };
   let saved = null, removed = false;
   const dlg = openDialog({
-    title: isNew ? '患者を追加' : '患者の情報',
+    title: (isNew ? '患者を追加' : '患者の情報') + (db.places.size > 1 ? `（${place.name}）` : ''),
     body: [
-      h('label', { class: 'f' }, 'カルテの番号（No）', no),
-      h('label', { class: 'f' }, '呼び名', label),
+      nameMode ? [h('label', { class: 'f' }, '名前', name), h('label', { class: 'f' }, 'よみ', yomi)]
+        : [h('label', { class: 'f' }, 'カルテの番号（No）', no), h('label', { class: 'f' }, '呼び名', label)],
       h('label', { class: 'f' }, 'メモ', memo),
-      h('p', { class: 'sub' }, '氏名・住所・電話番号はここに入れず、GoodNotes の問診票に残してください。問診票の「No」の欄に同じ番号を書いておくと、すぐに照らし合わせられます。'),
+      h('p', { class: 'sub' }, nameMode ? '名前は、この端末の中と、書き出した控え・CSV のファイルに入ります。ファイルの置き場所や渡す相手にご注意ください。'
+        : '氏名・住所・電話番号はここに入れず、GoodNotes の問診票に残してください。問診票の「No」の欄に同じ番号を書いておくと、すぐに照らし合わせられます。'),
       isNew ? null : h('button', { class: 'btn danger small', style: 'align-self:flex-start', onclick: async () => {
         const n = visitsOf(p.id).length;
         if (!await confirmDialog(`${patientName(p)} を削除します。${n ? `\nこの患者の記録 ${n} 回分も消え、元に戻せません。` : ''}`, '削除する', true)) return;
@@ -191,6 +216,38 @@ function editPatient(p) {
     ],
     footer: [h('button', { class: 'btn', onclick: () => dlg.close() }, 'やめる'), h('button', { class: 'btn primary', onclick: save }, '保存')],
     onClose: () => { if (removed) go('#/'); else if (saved && isNew) go('#/p/' + saved); else render(); },
+  });
+}
+
+/* ---------- 場所（治療院・病院など） ---------- */
+function editPlace(pl) {
+  const isNew = !pl;
+  const count = isNew ? 0 : [...db.patients.values()].filter(p => placeOf(p) === pl.id).length;
+  const name = h('input', { type: 'text', value: isNew ? '' : pl.name, placeholder: '例：〇〇病院', autocomplete: 'off' });
+  let mode = isNew ? 'no' : pl.mode || 'no';
+  const modes = h('div', { class: 'seg' });
+  const drawModes = () => modes.replaceChildren(...[['no', '番号で管理'], ['name', '名前で管理']].map(([m, l]) => h('button', { class: 'btn', 'aria-pressed': String(mode === m), onclick: () => { mode = m; drawModes(); } }, l)));
+  drawModes();
+  const dlg = openDialog({
+    title: isNew ? '場所を追加' : '場所',
+    body: [
+      h('label', { class: 'f' }, '場所の名前', name),
+      h('div', { class: 'f' }, h('span', { class: 'sub' }, '患者の管理のしかた'), modes),
+      h('p', { class: 'sub' }, '「番号で管理」はカルテの番号と呼び名、「名前で管理」は患者の名前で登録します。ツボと症状のリストは、すべての場所で共通です。' + (count ? 'すでに登録した患者の表示は、その患者を開いて保存しなおすまで変わりません。' : '')),
+      isNew ? null : count || db.places.size <= 1 ? h('p', { class: 'sub' }, count ? `患者が ${count}人 登録されているので、この場所は削除できません。` : '場所は1つ以上必要なので、削除できません。')
+        : h('button', { class: 'btn danger small', style: 'align-self:flex-start', onclick: async () => { await del('places', pl.id); dlg.close(); } }, 'この場所を削除'),
+    ],
+    footer: [h('button', { class: 'btn', onclick: () => dlg.close() }, 'やめる'), h('button', { class: 'btn primary', onclick: async () => {
+      const t = name.value.trim();
+      if (!t) { toast('場所の名前を入れてください'); return; }
+      if (places().some(o => o.name === t && (isNew || o.id !== pl.id))) { toast(`「${t}」はすでにあります`); return; }
+      const obj = isNew ? { id: uid(), created: Date.now() } : pl;
+      Object.assign(obj, { name: t, mode });
+      await put('places', obj);
+      if (isNew) { await metaSet('place', obj.id); patientQuery = ''; }
+      dlg.close();
+    } }, '保存')],
+    onClose: render,
   });
 }
 
@@ -347,10 +404,12 @@ function pickTsubo(v) {
 }
 
 /* ---------- 統計 ---------- */
-const stats = { mode: 'symptom', symptomId: undefined, tsuboId: undefined, period: 'all', sort: 'good' };
+const stats = { mode: 'symptom', symptomId: undefined, tsuboId: undefined, period: 'all', sort: 'good', place: 'all' };
 function viewStats() {
   const from = stats.period === 'all' ? null : (() => { const d = new Date(); d.setMonth(d.getMonth() - Number(stats.period)); return ymd(d); })();
-  const visits = [...db.visits.values()].filter(v => !from || v.date >= from);
+  if (!db.places.has(stats.place)) stats.place = 'all';
+  const inPlace = v => { const p = db.patients.get(v.patientId); return stats.place === 'all' || (p && placeOf(p) === stats.place); };
+  const visits = [...db.visits.values()].filter(v => (!from || v.date >= from) && inPlace(v));
   const rows = flatten(visits);
   const set = (k, val) => { stats[k] = val; render(); };
   const head = [
@@ -360,6 +419,7 @@ function viewStats() {
       h('div', null, h('b', null, new Set(visits.map(v => v.patientId)).size), h('span', null, '患者')),
       h('div', null, h('b', null, visits.length), h('span', null, '来院')),
       h('div', null, h('b', null, rows.length), h('span', null, 'ツボ（のべ）'))),
+    db.places.size > 1 ? h('select', { 'aria-label': '場所', onchange: e => set('place', e.target.value) }, [['all', 'すべての場所'], ...places().map(pl => [pl.id, pl.name])].map(([val, l]) => h('option', { value: val, selected: stats.place === val }, l))) : null,
   ];
   const period = h('select', { 'aria-label': '期間', onchange: e => set('period', e.target.value) }, [['all', '全期間'], ['3', '直近3か月'], ['12', '直近1年']].map(([val, l]) => h('option', { value: val, selected: stats.period === val }, l)));
   if (!rows.length) return [...head, period, h('p', { class: 'empty' }, 'この期間の記録がまだありません。施術を記録すると、ここに集計が出ます。')];
@@ -398,7 +458,23 @@ function viewStats() {
 
 /* ---------- リスト（ツボ・症状） ---------- */
 let listKind = 'tsubo';
+const listSeg = () => h('div', { class: 'seg' }, [['tsubo', `ツボ（${db.tsubo.size}）`], ['symptoms', `症状（${db.symptoms.size}）`], ['places', `場所（${db.places.size}）`]].map(([k, l]) => h('button', { class: 'btn', 'aria-pressed': String(listKind === k), onclick: () => { listKind = k; render(); } }, l)));
+function viewPlaces() {
+  const count = new Map();
+  for (const p of db.patients.values()) count.set(placeOf(p), (count.get(placeOf(p)) || 0) + 1);
+  return [
+    topbar('リスト'),
+    listSeg(),
+    h('div', { class: 'card' },
+      h('p', { class: 'sub' }, '治療院・病院など、患者を分けて管理する場所です。場所ごとに、患者を番号で管理するか、名前で管理するかを選べます。'),
+      h('button', { class: 'btn primary', onclick: () => editPlace(null) }, '＋ 場所を追加')),
+    h('ul', { class: 'list' }, places().map(pl => h('li', null, h('button', { class: 'item', onclick: () => editPlace(pl) },
+      h('span', { class: 'ttl' }, pl.name),
+      h('span', { class: 'sub' }, `${pl.mode === 'name' ? '名前で管理' : '番号で管理'}・患者 ${count.get(pl.id) || 0}人`))))),
+  ];
+}
 function viewLists() {
+  if (listKind === 'places') return viewPlaces();
   const isT = listKind === 'tsubo';
   const word = isT ? 'ツボ' : '症状';
   const used = new Map();
@@ -417,7 +493,7 @@ function viewLists() {
   name.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) add(); });
   return [
     topbar('リスト'),
-    h('div', { class: 'seg' }, [['tsubo', `ツボ（${db.tsubo.size}）`], ['symptoms', `症状（${db.symptoms.size}）`]].map(([k, l]) => h('button', { class: 'btn', 'aria-pressed': String(listKind === k), onclick: () => { listKind = k; render(); } }, l))),
+    listSeg(),
     h('div', { class: 'card' },
       h('div', { class: 'row' }, h('div', { class: 'grow' }, name), h('button', { class: 'btn primary', onclick: add }, '追加')),
       h('button', { class: 'btn small', style: 'align-self:flex-start', onclick: () => bulkAdd(isT) }, 'まとめて追加')),
@@ -493,11 +569,11 @@ async function saveFile(name, text, type) {
 const stamp = () => today().replace(/-/g, '');
 function toCsv() {
   const q = s => '"' + String(s == null ? '' : s).replace(/"/g, '""') + '"';
-  const lines = [['日付', '患者No', '回数', '症状', 'ツボ', '左右', 'ねらい', '効果'].map(q).join(',')];
+  const lines = [['日付', '場所', '患者', '回数', '症状', 'ツボ', '左右', 'ねらい', '効果'].map(q).join(',')];
   const idx = visitsByPatient();
   for (const v of [...db.visits.values()].sort(visitOrder)) {
     const p = db.patients.get(v.patientId), n = (idx.get(v.patientId) || []).indexOf(v) + 1;
-    for (const r of v.rows) lines.push([v.date, p ? p.no : '', n, r.symptomId ? symptomName(r.symptomId) : '', tsuboName(r.tsuboId), sideLabel(r.side) === '中' ? '' : sideLabel(r.side), r.aim || '', effectMark(r.effect)].map(q).join(','));
+    for (const r of v.rows) lines.push([v.date, p ? db.places.get(placeOf(p)).name : '', p ? p.name || p.no || '' : '', n, r.symptomId ? symptomName(r.symptomId) : '', tsuboName(r.tsuboId), sideLabel(r.side) === '中' ? '' : sideLabel(r.side), r.aim || '', effectMark(r.effect)].map(q).join(','));
   }
   return '﻿' + lines.join('\r\n');
 }
@@ -508,7 +584,7 @@ function viewSettings() {
     if (!f) return;
     let data;
     try { data = JSON.parse(await f.text()); if (data.app !== 'tsubo-kiroku') throw new Error('format'); } catch (err) { toast('ツボ記録の控えファイルではないようです'); return; }
-    const kinds = ['patients', 'visits', 'tsubo', 'symptoms'];
+    const kinds = ['places', 'patients', 'visits', 'tsubo', 'symptoms'];
     const count = k => (Array.isArray(data[k]) ? data[k].length : 0);
     if (!await confirmDialog(`控えを読み込みます。\n患者 ${count('patients')}人・来院 ${count('visits')}回・ツボ ${count('tsubo')}個・症状 ${count('symptoms')}個\n\nいまの記録は残したまま足します。同じ記録がある場合は、控えの内容で上書きします。`, '読み込む')) return;
     const byKind = {};
@@ -525,7 +601,7 @@ function viewSettings() {
       h('p', { class: 'sub' }, lastBackup ? `最後に書き出した日：${fmtDate(ymd(new Date(lastBackup)))}` : 'まだ書き出していません。'),
       h('button', { class: 'btn primary', onclick: async () => {
         const data = { app: 'tsubo-kiroku', version: 1, exported: new Date().toISOString() };
-        for (const k of ['patients', 'visits', 'tsubo', 'symptoms']) data[k] = [...db[k].values()];
+        for (const k of ['places', 'patients', 'visits', 'tsubo', 'symptoms']) data[k] = [...db[k].values()];
         if (await saveFile(`ツボ記録-控え-${stamp()}.json`, JSON.stringify(data), 'application/json')) { await metaSet('lastBackup', Date.now()); render(); }
       } }, '控えを書き出す'),
       h('button', { class: 'btn', onclick: () => file.click() }, '控えを読み込む'), file),
@@ -554,6 +630,7 @@ async function main() {
     for (const s of seed) db.symptoms.set(s.id, s);
     await metaSet('seeded', true);
   }
+  if (!db.places.size) await put('places', { id: uid(), name: '治療院', mode: 'no', created: Date.now() });
   window.addEventListener('hashchange', render);
   render();
   const local = ['localhost', '127.0.0.1'].includes(location.hostname);

@@ -1,8 +1,8 @@
 // 記録の保存先。いまは、この端末の中（IndexedDB）だけに保存する。
 // 画面側は loadAll / put / del / putMany しか使わないので、あとで保存先（クラウドなど）を足すときは、ここだけ差し替えればよい。
 const DB = 'tsubo-kiroku';
-const VER = 1;
-export const KINDS = ['patients', 'visits', 'tsubo', 'symptoms', 'meta'];
+const VER = 2;                                  // 2：場所（places）を追加
+export const KINDS = ['patients', 'visits', 'tsubo', 'symptoms', 'places', 'meta'];
 
 export async function openStore() {
   const idb = await new Promise((res, rej) => {
