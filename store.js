@@ -4,13 +4,18 @@ const DB = 'tsubo-kiroku';
 const VER = 2;                                  // 2：場所（places）を追加
 export const KINDS = ['patients', 'visits', 'tsubo', 'symptoms', 'places', 'meta'];
 
-export async function openStore() {
+// onBlocked：ほかのタブが古い版のまま開いていて、保存場所の作り替えを待たされているときに呼ぶ（そのタブが閉じられると、自動で先へ進む）
+// onStale：ほかのタブが新しい版で開かれ、このタブが古くなったときに呼ぶ
+export async function openStore({ onBlocked, onStale } = {}) {
   const idb = await new Promise((res, rej) => {
     const r = indexedDB.open(DB, VER);
     r.onupgradeneeded = () => { for (const k of KINDS) if (!r.result.objectStoreNames.contains(k)) r.result.createObjectStore(k, { keyPath: 'id' }); };
+    r.onblocked = () => { if (onBlocked) onBlocked(); };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
   });
+  // 新しい版が保存場所を作り替えようとしたら、すぐに手を離す（離さないと、新しい版の画面が開けずに止まってしまう）
+  idb.onversionchange = () => { idb.close(); if (onStale) onStale(); };
   // 1回の書き込みをひとまとまりで行い、途中で失敗したら全部なかったことにする
   const write = fn => new Promise((res, rej) => {
     const t = idb.transaction(KINDS, 'readwrite');

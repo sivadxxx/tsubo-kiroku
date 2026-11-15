@@ -4,7 +4,7 @@ import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 import { createCloud, explain } from './cloud-firebase.js';
 import { firebaseConfig } from './config.js';
 
-const VERSION = '1.2';
+const VERSION = '1.3';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -761,7 +761,10 @@ function syncCard() {
 /* ---------- はじまり ---------- */
 async function main() {
   try {
-    localStore = await openStore();
+    localStore = await openStore({
+      onBlocked: () => $('#view').replaceChildren(h('p', { class: 'empty' }, 'ほかのタブ（ウィンドウ）で、古い版のツボ記録が開いたままになっています。そのタブを閉じてください。閉じると、この画面は自動で開きます。')),
+      onStale: () => location.reload(),          // このタブが古くなった：読み込み直して新しい版にする
+    });
     store = localStore;
     const all = await localStore.loadAll();
     for (const k of Object.keys(db)) for (const o of all[k] || []) db[k].set(o.id, o);
