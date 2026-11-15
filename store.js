@@ -31,5 +31,7 @@ export async function openStore() {
     del: (kind, id) => write(t => t.objectStore(kind).delete(id)),
     putMany: byKind => write(t => { for (const k of Object.keys(byKind)) for (const o of byKind[k]) t.objectStore(k).put(o); }),
     delMany: byKind => write(t => { for (const k of Object.keys(byKind)) for (const id of byKind[k]) t.objectStore(k).delete(id); }),
+    // 記録（患者・来院・ツボ・症状・場所）をすべて消す。クラウドに移し終えたあとに使う。端末ごとの設定（meta）は残す
+    clearData: () => write(t => { for (const k of KINDS) if (k !== 'meta') t.objectStore(k).clear(); }),
   };
 }

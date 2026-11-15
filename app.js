@@ -1,14 +1,16 @@
 // ツボ記録：来院ごとに使ったツボを選んで残し、症状ごとに「効いたツボ」を集計する
 import { openStore } from './store.js';
 import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
+import { createCloud, explain } from './cloud-firebase.js';
+import { firebaseConfig } from './config.js';
 
-const VERSION = '1.1';
+const VERSION = '1.2';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
 const sideLabel = v => (SIDES.find(s => s.v === (v || '')) || SIDES[3]).label;
 
-let store;
+let store;                 // いまの保存先。ログインしていないときは端末の中、ログイン中はクラウド
 const db = { patients: new Map(), visits: new Map(), tsubo: new Map(), symptoms: new Map(), places: new Map(), meta: new Map() };
 
 /* ---------- 小さな道具 ---------- */
@@ -86,7 +88,7 @@ function openDialog({ title, body, footer, full, onClose }) {
       h('div', { class: 'row' }, h('h1', { class: 'grow' }, title), full ? h('button', { class: 'btn primary', onclick: () => dlg.close() }, '完了') : null),
       h('div', { class: 'scroll' }, body),
       footer ? h('div', { class: 'row wrap', style: 'justify-content:flex-end' }, footer) : null));
-  dlg.addEventListener('close', () => { dlg.remove(); if (onClose) onClose(); });
+  dlg.addEventListener('close', () => { dlg.remove(); if (onClose) onClose(); setTimeout(() => { if (needRender && !busy()) render(); }, 50); });
   document.body.append(dlg);
   dlg.showModal();
   return dlg;
@@ -115,6 +117,12 @@ function parseRoute() {
 function go(hash) { if (location.hash === hash) render(); else location.hash = hash; }
 async function render() {
   const r = parseRoute();
+  needRender = false;
+  if (!db.places.size && r.name !== 'settings') {      // ログイン直後など、クラウドの記録がまだ届いていないとき
+    $('#view').replaceChildren(h('p', { class: 'empty' }, user && syncError ? `クラウドから記録を読み込めませんでした（${syncError}）「設定」をご覧ください。` : '記録を読み込んでいます…'));
+    lastRoute = r.key;
+    return;
+  }
   // 何も入れずに閉じた来院の記録は残さない
   const left = lastRoute.startsWith('v/') && lastRoute !== r.key ? db.visits.get(lastRoute.slice(2)) : null;
   if (left && isEmptyVisit(left)) await del('visits', left.id);
@@ -152,14 +160,15 @@ function viewPatients() {
   };
   draw();
   const lastBackup = metaGet('lastBackup');
-  const stale = db.visits.size >= 5 && (!lastBackup || Date.now() - lastBackup > 30 * 864e5);
+  const stale = !user && db.visits.size >= 5 && (!lastBackup || Date.now() - lastBackup > 30 * 864e5);
   return [
     topbar('ツボ記録', null, null, h('button', { class: 'btn primary', onclick: () => editPatient(null) }, '＋ 患者を追加')),
     h('div', { class: 'chips' },
       places().map(pl => h('button', { class: 'chip', 'aria-pressed': String(pl.id === place.id), onclick: async () => { patientQuery = ''; await metaSet('place', pl.id); render(); } }, pl.name)),
       h('button', { class: 'chip', style: 'color:var(--sub)', onclick: () => editPlace(null) }, '＋ 場所')),
     mine.length > 5 ? h('input', { type: 'search', placeholder: place.mode === 'name' ? '名前・よみでさがす' : '番号・呼び名でさがす', value: patientQuery, oninput: e => { patientQuery = e.target.value; draw(); } }) : null,
-    stale ? h('button', { class: 'item', onclick: () => go('#/settings') }, h('span', { class: 'sub' }, lastBackup ? '控えを取ってから1か月以上たっています。「控え」から書き出しておくと安心です。' : 'まだ控えを取っていません。「控え」から書き出しておくと安心です。')) : null,
+    stale ? h('button', { class: 'item', onclick: () => go('#/settings') }, h('span', { class: 'sub' }, lastBackup ? '控えを取ってから1か月以上たっています。「設定」から書き出しておくと安心です。' : 'まだ控えを取っていません。「設定」から書き出しておくと安心です。')) : null,
+    user && syncError ? h('button', { class: 'item', onclick: () => go('#/settings') }, h('span', { class: 'sub', style: 'color:var(--danger)' }, `クラウドとのやりとりで問題が起きています（${syncError}）`)) : null,
     listEl,
   ];
 }
@@ -203,7 +212,7 @@ function editPatient(p) {
       nameMode ? [h('label', { class: 'f' }, '名前', name), h('label', { class: 'f' }, 'よみ', yomi)]
         : [h('label', { class: 'f' }, 'カルテの番号（No）', no), h('label', { class: 'f' }, '呼び名', label)],
       h('label', { class: 'f' }, 'メモ', memo),
-      h('p', { class: 'sub' }, nameMode ? '名前は、この端末の中と、書き出した控え・CSV のファイルに入ります。ファイルの置き場所や渡す相手にご注意ください。'
+      h('p', { class: 'sub' }, nameMode ? (user ? '名前は、クラウド（読めるのはご自身のログインだけ）と、書き出した控え・CSV のファイルに入ります。' : '名前は、この端末の中と、書き出した控え・CSV のファイルに入ります。') + 'ファイルの置き場所や渡す相手にご注意ください。'
         : '氏名・住所・電話番号はここに入れず、GoodNotes の問診票に残してください。問診票の「No」の欄に同じ番号を書いておくと、すぐに照らし合わせられます。'),
       isNew ? null : h('button', { class: 'btn danger small', style: 'align-self:flex-start', onclick: async () => {
         const n = visitsOf(p.id).length;
@@ -594,10 +603,11 @@ function viewSettings() {
     toast('読み込みました'); render();
   } });
   return [
-    topbar('控え'),
+    topbar('設定'),
+    syncCard(),
     h('div', { class: 'card' },
       h('h2', null, '控え（バックアップ）'),
-      h('p', null, '記録は、この端末の中だけに保存されています。端末の故障や買い替えに備えて、ときどき控えを書き出してください。'),
+      h('p', null, user ? '記録はクラウドにも保存されています。控えは、念のための写しとして書き出せます。' : '記録は、この端末の中だけに保存されています。端末の故障や買い替えに備えて、ときどき控えを書き出してください。'),
       h('p', { class: 'sub' }, lastBackup ? `最後に書き出した日：${fmtDate(ymd(new Date(lastBackup)))}` : 'まだ書き出していません。'),
       h('button', { class: 'btn primary', onclick: async () => {
         const data = { app: 'tsubo-kiroku', version: 1, exported: new Date().toISOString() };
@@ -613,27 +623,190 @@ function viewSettings() {
   ];
 }
 
+/* ---------- 同期（クラウド） ---------- */
+// ログインすると、記録の置き場所が「端末の中」から「クラウド」に変わる。端末ごとの設定（いま開いている場所・控えの日付など）は端末に残す。
+const DATA_KINDS = ['places', 'patients', 'visits', 'tsubo', 'symptoms'];
+const isLocalhost = ['localhost', '127.0.0.1'].includes(location.hostname);
+let localStore, cloud = null, cloudFailed = false, user = null, syncError = '', needRender = false, unsubs = [];
+async function loadCloud() {
+  if (isLocalhost && new URLSearchParams(location.search).has('mock')) return (await import('./src/cloud-mock.js')).createCloud();   // 動作確認用
+  return createCloud(firebaseConfig);
+}
+function syncProblem(e) { console.error(e); syncError = explain(e); toast('クラウドに保存できませんでした。' + syncError); }
+// クラウドを保存先にする。書き込みは待たずに戻る（電波がないときは端末にたまり、つながったときに送られる）
+function cloudStore(me) {
+  const bg = p => { p.catch(syncProblem); return Promise.resolve(); };
+  return {
+    put: (kind, obj) => (kind === 'meta' ? localStore.put(kind, obj) : bg(cloud.set(me, kind, obj))),
+    del: (kind, id) => (kind === 'meta' ? localStore.del(kind, id) : bg(cloud.remove(me, kind, id))),
+    putMany: byKind => { for (const k of Object.keys(byKind)) for (const o of byKind[k]) bg(cloud.set(me, k, o)); return Promise.resolve(); },
+    delMany: byKind => { for (const k of Object.keys(byKind)) for (const id of byKind[k]) bg(cloud.remove(me, k, id)); return Promise.resolve(); },
+  };
+}
+// 入力の途中や、重ねた画面を開いているあいだは描き直さない（入力が途切れないように）。あとで描き直す
+const busy = () => !!document.querySelector('dialog[open]') || /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || '');
+function remoteChanged() { if (busy()) needRender = true; else render(); }
+
+// この端末の中の記録を、クラウドの記録に合わせて1つにまとめる。クラウドに届いたことを確かめてから、端末の中の記録を消す
+async function mergeLocalIntoCloud(me) {
+  const remote = {}, local = {};
+  for (const k of DATA_KINDS) remote[k] = await cloud.fetch(me, k);          // ルールが未設定なら、ここで断られる
+  for (const k of DATA_KINDS) local[k] = [...db[k].values()].map(o => JSON.parse(JSON.stringify(o)));
+  // 同じ名前の場所・ツボ・症状がクラウドにあれば、そちらを使う（端末ごとに同じものが二重にならないように）
+  const remap = {};
+  for (const k of ['places', 'tsubo', 'symptoms']) {
+    const ids = new Set(remote[k].map(o => o.id)), byNm = new Map(remote[k].map(o => [o.name, o.id]));
+    remap[k] = new Map(local[k].filter(o => !ids.has(o.id) && byNm.has(o.name)).map(o => [o.id, byNm.get(o.name)]));
+  }
+  const to = (k, id) => remap[k].get(id) || id;
+  const known = new Set([...local.places, ...remote.places].map(o => o.id));
+  const first = [...local.places, ...remote.places].sort((a, b) => a.created - b.created)[0];
+  for (const p of local.patients) p.placeId = to('places', known.has(p.placeId) ? p.placeId : first.id);
+  for (const v of local.visits) {
+    v.symptoms = [...new Set((v.symptoms || []).map(x => to('symptoms', x)))];
+    for (const r of v.rows || []) { r.tsuboId = to('tsubo', r.tsuboId); if (r.symptomId) r.symptomId = to('symptoms', r.symptomId); }
+  }
+  const usedPlaces = new Set(local.patients.map(p => p.placeId));
+  const ops = [];
+  for (const k of DATA_KINDS) {
+    const byId = new Map(remote[k].map(o => [o.id, o]));
+    for (const o of local[k]) {
+      if (remap[k] && remap[k].has(o.id)) continue;                                       // 同じ名前のものがクラウドにある
+      if (k === 'places' && remote.places.length && !usedPlaces.has(o.id)) continue;      // 患者のいない場所は持ち込まない
+      const r = byId.get(o.id);
+      if (r && (r.updated || 0) >= (o.updated || 0)) continue;                            // クラウドのほうが新しい
+      ops.push({ kind: k, obj: o });
+    }
+  }
+  if (!remote.places.length && !ops.some(o => o.kind === 'places')) ops.push({ kind: 'places', obj: { id: uid(), name: '治療院', mode: 'no', created: Date.now(), updated: Date.now() } });
+  await cloud.commit(me, ops);
+  for (const k of new Set(ops.map(o => o.kind))) {
+    const ids = new Set((await cloud.fetch(me, k)).map(o => o.id));
+    if (ops.some(o => o.kind === k && !ids.has(o.obj.id))) throw Object.assign(new Error('クラウドに届いていない記録があります'), { code: 'unavailable' });
+  }
+  await localStore.clearData();
+  const n = k => ops.filter(o => o.kind === k).length;
+  return { patients: n('patients'), visits: n('visits') };
+}
+// クラウドの記録を見張り、画面のもとになるデータ（db）に映す
+async function enterCloud(u) {
+  for (const off of unsubs) off();
+  unsubs = [];
+  for (const k of DATA_KINDS) db[k].clear();
+  user = u; store = cloudStore(u.uid); syncError = '';
+  let live = false;
+  await new Promise(res => {
+    const waiting = new Set(DATA_KINDS);
+    const got = k => { waiting.delete(k); if (!waiting.size) res(); };
+    for (const k of DATA_KINDS) unsubs.push(cloud.listen(u.uid, k, changes => {
+      let remote = false;
+      for (const c of changes) {
+        if (c.type === 'removed') { if (db[k].delete(c.id) && !c.local) remote = true; }
+        else if (!(c.local && db[k].has(c.id))) { db[k].set(c.id, c.data); if (!c.local) remote = true; }     // この端末の書き込みは、もう db に入っている
+      }
+      if (!live) got(k); else if (remote) remoteChanged();
+    }, e => { console.error(e); syncError = explain(e); if (!live) got(k); else remoteChanged(); }));
+    setTimeout(res, 8000);
+  });
+  live = true;
+  await metaSet('sync', { uid: u.uid, email: u.email });
+}
+async function login(email, pw, say) {
+  let u;
+  try { u = await cloud.signIn(email, pw); } catch (e) { say(explain(e)); return; }
+  try {
+    const moved = await mergeLocalIntoCloud(u.uid);
+    await enterCloud(u);
+    toast(moved.patients || moved.visits ? `この端末の記録（患者 ${moved.patients}人・来院 ${moved.visits}回）をクラウドに移しました` : '同期を始めました');
+    render();
+  } catch (e) {
+    console.error(e);
+    try { await cloud.signOut(false); } catch (e2) {}
+    say(e.code === 'permission-denied' ? 'ログインはできましたが、クラウド側の設定（ルール）がまだ済んでいないため、同期を始められませんでした。この端末の記録はそのままです。'
+      : `同期を始められませんでした。この端末の記録はそのままです。（${explain(e)}）`);
+  }
+}
+async function logout() {
+  const offline = navigator.onLine ? '' : '\n\nいま電波がありません。まだクラウドに送っていない記録があると、失われます。電波のあるところで行ってください。';
+  if (!await confirmDialog('ログアウトします。この端末では記録が見られなくなります（クラウドには残り、もう一度ログインすると戻ります）。' + offline, 'ログアウト', true)) return;
+  await metaSet('sync', null);
+  try { await cloud.signOut(true); } catch (e) { console.error(e); }
+  location.hash = '#/settings';
+  location.reload();
+}
+function syncCard() {
+  if (user) return h('div', { class: 'card' },
+    h('h2', null, '同期'),
+    h('p', null, `同期しています：${user.email}`),
+    h('p', { class: 'sub' }, '記録はクラウドに保存され、同じログインの端末にすぐ届きます。電波がないときは端末にためておき、つながったときに送ります。'),
+    syncError ? h('p', { style: 'color:var(--danger)' }, `クラウドとのやりとりで問題が起きています：${syncError}`) : null,
+    h('button', { class: 'btn', onclick: logout }, 'ログアウト'));
+  if (!cloud) return h('div', { class: 'card' }, h('h2', null, '同期'), h('p', { class: 'sub' }, cloudFailed ? '同期の準備ができませんでした。電波のあるところで開き直してください。' : '同期の準備をしています…'));
+  const email = h('input', { type: 'email', placeholder: 'メールアドレス', autocomplete: 'username', autocapitalize: 'off' });
+  const pw = h('input', { type: 'password', placeholder: 'パスワード', autocomplete: 'current-password' });
+  const msg = h('p', { style: 'color:var(--danger)', hidden: true });
+  const label = 'ログインして同期を始める';
+  const btn = h('button', { class: 'btn primary', onclick: async () => {
+    btn.disabled = true; btn.textContent = 'ログインしています…'; msg.hidden = true;
+    await login(email.value, pw.value, t => { msg.textContent = t; msg.hidden = false; });
+    btn.disabled = false; btn.textContent = label;
+  } }, label);
+  return h('div', { class: 'card' },
+    h('h2', null, '同期'),
+    h('p', null, 'ログインすると、記録がクラウドに保存され、iPad・iPhone・Mac で同じ記録を使えます。ツボマップ3D と同じメールアドレスとパスワードでログインします。'),
+    db.patients.size ? h('p', { class: 'sub' }, 'この端末に入っている記録は、ログインするとクラウドに移り、ほかの端末の記録と1つにまとまります。念のため、先に下の「控えを書き出す」をしておくと安心です。') : null,
+    email, pw, btn, msg);
+}
+
 /* ---------- はじまり ---------- */
 async function main() {
   try {
-    store = await openStore();
-    const all = await store.loadAll();
+    localStore = await openStore();
+    store = localStore;
+    const all = await localStore.loadAll();
     for (const k of Object.keys(db)) for (const o of all[k] || []) db[k].set(o.id, o);
   } catch (e) {
     console.error(e);
     $('#view').replaceChildren(h('p', { class: 'empty' }, '記録の保存場所を開けませんでした。プライベートブラウズを使っている場合は、通常の画面で開き直してください。'));
     return;
   }
-  if (!metaGet('seeded')) {
-    const seed = SEED_SYMPTOMS.map((name, i) => ({ id: uid(), name, archived: false, created: Date.now() + i, updated: Date.now() }));
-    await store.putMany({ symptoms: seed });
-    for (const s of seed) db.symptoms.set(s.id, s);
-    await metaSet('seeded', true);
-  }
-  if (!db.places.size) await put('places', { id: uid(), name: '治療院', mode: 'no', created: Date.now() });
+  // 端末の中で使うときの最初の用意（症状の初期リストと、最初の場所）
+  const prepareLocal = async () => {
+    if (!metaGet('seeded')) {
+      const seed = SEED_SYMPTOMS.map((name, i) => ({ id: uid(), name, archived: false, created: Date.now() + i, updated: Date.now() }));
+      await localStore.putMany({ symptoms: seed });
+      for (const s of seed) db.symptoms.set(s.id, s);
+      await metaSet('seeded', true);
+    }
+    if (!db.places.size) await put('places', { id: uid(), name: '治療院', mode: 'no', created: Date.now() });
+  };
   window.addEventListener('hashchange', render);
-  render();
-  const local = ['localhost', '127.0.0.1'].includes(location.hostname);
-  if ('serviceWorker' in navigator && !local) navigator.serviceWorker.register('sw.js').catch(() => {});
+  document.addEventListener('focusout', () => setTimeout(() => { if (needRender && !busy()) render(); }, 150));
+  if ('serviceWorker' in navigator && !isLocalhost) navigator.serviceWorker.register('sw.js').catch(() => {});
+
+  if (metaGet('sync')) {
+    // 前回ログインしていた：クラウドの記録を出す。端末の中の記録として使い始めてしまわないよう、準備できるまで待つ
+    $('#view').replaceChildren(h('p', { class: 'empty' }, '記録を読み込んでいます…'));
+    try {
+      cloud = await loadCloud();
+      const u = await cloud.ready;
+      if (u) await enterCloud(u);
+      else { await metaSet('sync', null); await prepareLocal(); }       // ログインが切れていた
+    } catch (e) {
+      console.error(e);
+      $('#view').replaceChildren(h('p', { class: 'empty' }, '同期の準備ができませんでした。電波のあるところで開き直してください。'), h('button', { class: 'btn', style: 'align-self:center', onclick: () => location.reload() }, 'もう一度ためす'));
+      return;
+    }
+    render();
+  } else {
+    await prepareLocal();
+    render();
+    const again = () => { if (parseRoute().name === 'settings' && !busy()) render(); };
+    loadCloud().then(async c => {
+      const u = await c.ready;
+      if (u) { try { await c.signOut(false); } catch (e) {} }             // 同期を始める途中で止まったログインは、やり直してもらう
+      cloud = c; again();
+    }).catch(e => { console.error(e); cloudFailed = true; again(); });
+  }
 }
 main();
