@@ -1,0 +1,70 @@
+# ツボ記録 — 開発の引き継ぎメモ（Claude 向け）
+
+鍼灸の施術記録アプリ。来院ごとに、使ったツボをリストから選んで記録し、「症状ごとの効いたツボ」を集計する。
+使い方と機能の説明は `README.md` にある。ここには、コードを読むだけでは分からない決まりと作業の流れを書く。
+
+- 公開先：https://sivadxxx.github.io/tsubo-kiroku/ （GitHub Pages。`main` ブランチの直下をそのまま公開）
+- 使う人：開発者本人だけ。iPad（GoodNotes と Split View で並べる）・iPhone・Mac で使う。
+  問診票と手書きメモは GoodNotes に残す前提で、このアプリは置き換えない。
+
+## 作業を始める前に
+
+- 開発は複数の Mac で行う。**始める前に必ず `git pull`、終わったら必ず `git push`** する。
+- 必要なもの：`git`、`gh`（GitHub にログイン済み）、`python3` と Pillow（`src/build.py` が使う）。
+
+## 設計の決まり
+
+- 素の JavaScript（ES modules）。ビルド工程やフレームワークは入れない。
+  - `index.html` 画面の骨組みと見た目（CSS はここに全部）
+  - `app.js` 画面の動きのすべて（`h()` で DOM を作り、`render()` で描き直す。ハッシュで画面を切り替える）
+  - `stats.js` 集計の計算だけ（画面に依存しない。`node` で単体で試せる）
+  - `store.js` 端末の中への保存（IndexedDB、DB 名 `tsubo-kiroku`）
+  - `cloud-firebase.js` ログインとクラウドへの保存、`config.js` Firebase の接続先（秘密の鍵ではない）
+  - `src/build.py` アイコン・`manifest.webmanifest`・`sw.js` を作る。`src/cloud-mock.js` は動作確認用のにせのクラウド
+- 見た目：クリーム色の地にテラコッタのアクセント（`:root` の変数）。ほかのアプリ（ツボマップ3D・人体図）とそろえる。
+- 画面の文言とコードのコメント、コミットメッセージは、平易な日本語で書く。
+- **スマホ幅を先に考える**（iPad の Split View と iPhone で使うため）。押すところは 44px 以上。
+- **公開リポジトリなので、使う人の勤務先の名前や個人情報を、コード・コメント・コミットに書かない。**
+  場所の名前は、アプリの中で使う人が入力する（コードには「治療院」という仮の名前だけがある）。
+- 患者は「場所」に属する。場所ごとに「番号で管理」（カルテの番号と呼び名。氏名は入れない）か「名前で管理」かを選ぶ。
+  ツボと症状のリストは、すべての場所で共通。
+- 効果は 3=◎ 2=○ 1=△ 0=×、未入力は `null`。「効いた」は ◎ と ○。割合は、効果を入れた回数に対するもの。
+
+## 保存と同期のしくみ
+
+- ログインしていないとき：記録は IndexedDB（`store.js`）。ログインしているとき：Firestore の
+  `kiroku/{本人のID}/{places|patients|visits|tsubo|symptoms}/{id}`。端末ごとの設定（`meta`）は、いつも端末の中。
+- 画面側は `store`（`put` / `del` / `putMany` / `delMany`）しか使わない。ログインすると `store` がクラウド用に差し替わる。
+  クラウドへの書き込みは**待たない**（電波がないときは端末にたまり、あとで送られる。待つと画面が止まる）。
+- ログインしたとき（`mergeLocalIntoCloud`）：端末の中の記録をクラウドの記録と1つにまとめる。同じ名前の場所・ツボ・症状は
+  クラウド側の ID に寄せる。クラウドに届いたことを読み直して確かめてから、端末の中の記録を消す。
+- ほかの端末からの変化は `remoteChanged()` で描き直す。入力の途中や重ねた画面を開いているあいだ（`busy()`）は、あとに回す。
+- **IndexedDB の `VER` を上げるとき**：古い版を開いたままのタブがあると、新しい版は作り替えを待たされる。
+  `onblocked`（案内を出す）と `onversionchange`（古いタブが手を離して読み込み直す）を必ず残すこと。
+- Firebase は、ツボマップ3D と同じプロジェクト `tsubomap3d`。ルールは Firebase の管理画面にあるものが正。
+  ツボ記録の分は次のかたまり（`hasRole` はツボマップ3D のルールにある関数。管理者だけが、自分の記録だけを読み書きできる）。
+  ルールの変更は、使う人が管理画面で貼り付けて「公開」する（Claude からは変更しない）。
+
+  ```
+  match /kiroku/{uid}/{kind}/{id} {
+    allow read, write: if hasRole(['owner']) && request.auth.uid == uid;
+  }
+  ```
+
+## 動作確認
+
+- 手元で開く：このフォルダで `python3 -m http.server 8768 --bind 127.0.0.1`（`.claude/launch.json` の `tsubokiroku`）。
+  localhost では Service Worker を登録しない。
+- 同期の確認は、にせのクラウドで行う：`http://localhost:8768/?mock`。パスワードは `testpass1`。
+  メールアドレスが `norules@` で始まると、ルール未設定のときと同じく断られる。
+  「クラウド」の中身は localStorage にあり、別の文書（iframe や別タブ）から書き換えると、ほかの端末からの変化を再現できる。
+- **本物の Firebase には、Claude はログインできない**（パスワードを入力しない）。本物での確認は、使う人に頼む。
+- iPad の Split View 相当（幅 507px）と iPhone 相当（幅 375px）で、はみ出しがないかを見る。
+- 確認で入れたテストデータは、終わったら消す（IndexedDB の `tsubo-kiroku`、localStorage、sessionStorage）。
+
+## 公開の流れ
+
+1. `python3 src/build.py`（`sw.js` の版が変わり、使う人の端末が新しい内容に入れ替わる。**直したあとは必ず実行**）
+2. コミットして `git push origin main`
+3. GitHub Pages の反映を待ち、公開されたファイルが手元と同じかを照らし合わせる
+4. 使う人の端末では、アプリを閉じて開き直すと新しい版になる（1回で変わらなければ、もう一度）
