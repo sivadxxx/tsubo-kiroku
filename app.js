@@ -4,14 +4,14 @@ import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 import { createCloud, explain } from './cloud-firebase.js';
 import { firebaseConfig } from './config.js';
 
-const VERSION = '1.3';
+const VERSION = '1.4';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
 const sideLabel = v => (SIDES.find(s => s.v === (v || '')) || SIDES[3]).label;
 
 let store;                 // いまの保存先。ログインしていないときは端末の中、ログイン中はクラウド
-const db = { patients: new Map(), visits: new Map(), tsubo: new Map(), symptoms: new Map(), places: new Map(), meta: new Map() };
+const db = { patients: new Map(), visits: new Map(), tsubo: new Map(), symptoms: new Map(), places: new Map(), staff: new Map(), meta: new Map() };
 
 /* ---------- 小さな道具 ---------- */
 const $ = s => document.querySelector(s);
@@ -71,6 +71,14 @@ const tsuboName = id => (db.tsubo.get(id) || { name: '（消したツボ）' }).
 const symptomName = id => (id == null ? '症状を選んでいない記録' : (db.symptoms.get(id) || { name: '（消した症状）' }).name);
 const activeTsubo = () => [...db.tsubo.values()].filter(t => !t.archived);
 const activeSymptoms = () => [...db.symptoms.values()].filter(s => !s.archived);
+// 担当者（施術をした人）。来院の記録ごとに1人選べる（選ばなくてもよい）
+const staffName = id => (db.staff.get(id) || { name: '（消した担当者）' }).name;
+const activeStaff = () => [...db.staff.values()].filter(s => !s.archived).sort((a, b) => a.created - b.created);
+// 新しい記録に最初から入れておく担当者：この患者の前回の担当者 → この端末で最後に選んだ担当者 → 1人しかいなければその人
+function defaultStaff(last) {
+  const act = activeStaff(), ok = id => act.some(s => s.id === id);
+  return last && ok(last.staffId) ? last.staffId : ok(metaGet('staff')) ? metaGet('staff') : act.length === 1 ? act[0].id : null;
+}
 // 場所（治療院・病院など）。患者は、どこか1つの場所に属する。場所の決まっていない患者（場所ができる前の記録）は、最初の場所に属するものとして扱う
 const places = () => [...db.places.values()].sort((a, b) => a.created - b.created);
 const placeOf = p => (db.places.has(p.placeId) ? p.placeId : places()[0].id);
@@ -269,7 +277,7 @@ function viewPatient(id) {
     let v = vs.find(x => x.date === today());
     if (!v) {
       const last = vs[vs.length - 1];
-      v = { id: uid(), patientId: id, date: today(), symptoms: last ? last.symptoms.filter(s => db.symptoms.has(s)) : [], rows: [], memo: '', created: Date.now() };
+      v = { id: uid(), patientId: id, date: today(), staffId: defaultStaff(last), symptoms: last ? last.symptoms.filter(s => db.symptoms.has(s)) : [], rows: [], memo: '', created: Date.now() };
       await put('visits', v);
     }
     go('#/v/' + v.id);
@@ -279,7 +287,7 @@ function viewPatient(id) {
     h('button', { class: 'btn primary big', onclick: start }, vs.some(x => x.date === today()) ? '今日の記録を開く' : '＋ 今日の施術を記録'),
     h('h2', null, `これまでの記録（${vs.length}回）`),
     vs.length ? h('ul', { class: 'list' }, vs.map((v, i) => h('li', null, h('button', { class: 'item', onclick: () => go('#/v/' + v.id) },
-      h('span', { class: 'ttl' }, fmtDate(v.date), h('small', null, `${i + 1}回目`), v.symptoms.map(s => h('span', { class: 'tag' }, symptomName(s)))),
+      h('span', { class: 'ttl' }, fmtDate(v.date), h('small', null, `${i + 1}回目` + (db.staff.has(v.staffId) ? `・担当 ${staffName(v.staffId)}` : '')), v.symptoms.map(s => h('span', { class: 'tag' }, symptomName(s)))),
       h('span', { class: 'marks' }, v.rows.length ? v.rows.map(r => h('span', null, tsuboName(r.tsuboId), sideLabel(r.side) === '中' ? '' : ' ' + sideLabel(r.side), r.effect != null ? [' ', h('b', null, effectMark(r.effect))] : '')) : h('span', { class: 'sub' }, 'ツボの記録なし')),
       v.memo ? h('span', { class: 'sub' }, v.memo) : null))).reverse())
       : h('p', { class: 'empty' }, 'まだ記録がありません。'),
@@ -298,6 +306,17 @@ function viewVisit(id) {
   const saveSoon = debounce(save, 500);
   const change = async () => { await save(); render(); };
   const multi = v.symptoms.length >= 2;
+  // 担当者：使える人を登録した順に。いまは使わない人でも、この記録に入っていれば出す
+  const staffList = activeStaff();
+  if (db.staff.has(v.staffId) && !staffList.some(s => s.id === v.staffId)) staffList.push(db.staff.get(v.staffId));
+  const staffEl = h('div', { class: 'chips', role: 'group', 'aria-label': '担当者' },
+    staffList.length ? h('span', { class: 'sub', style: 'align-self:center;margin-right:2px' }, '担当者') : null,
+    staffList.map(s => h('button', { class: 'chip', 'aria-pressed': String(v.staffId === s.id), onclick: async () => {
+      v.staffId = v.staffId === s.id ? null : s.id;
+      if (v.staffId) await metaSet('staff', s.id);
+      change();
+    } }, s.name)),
+    h('button', { class: 'chip', style: 'color:var(--sub)', 'aria-label': '担当者を追加', onclick: () => addStaff(v) }, staffList.length ? '＋' : '＋ 担当者'));
 
   const aims = new Map();
   for (const x of db.visits.values()) for (const r of x.rows) if (r.aim) aims.set(r.aim, (aims.get(r.aim) || 0) + 1);
@@ -319,6 +338,7 @@ function viewVisit(id) {
   return [
     topbar(patientName(p), '#/p/' + v.patientId, `${n}回目`),
     h('input', { type: 'date', 'aria-label': '日付', value: v.date, onchange: e => { if (e.target.value) { v.date = e.target.value; change(); } } }),
+    staffEl,
     h('div', { class: 'card' },
       h('h2', null, '今日みる症状'),
       v.symptoms.length ? h('div', { class: 'chips' }, v.symptoms.map(s => h('span', { class: 'tag', style: 'font-size:14px;padding:4px 12px' }, symptomName(s)))) : h('p', { class: 'sub' }, '症状を選んでおくと、あとで「症状ごとの効いたツボ」が集計できます。'),
@@ -341,6 +361,29 @@ function viewVisit(id) {
     } }, 'この日の記録を削除'),
     aimList,
   ];
+}
+
+// 来院の記録の画面から、担当者をその場で足す（足した人が、この記録の担当者になる）
+function addStaff(v) {
+  const name = h('input', { type: 'text', placeholder: '担当者の名前', autocomplete: 'off' });
+  const save = async () => {
+    const t = name.value.trim().replace(/\s+/g, ' ');
+    if (!t) { toast('名前を入れてください'); return; }
+    const s = [...db.staff.values()].find(x => x.name === t) || { id: uid(), name: t, created: Date.now() };
+    s.archived = false;
+    await put('staff', s);
+    v.staffId = s.id;
+    await put('visits', v);
+    await metaSet('staff', s.id);
+    dlg.close();
+  };
+  name.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) save(); });
+  const dlg = openDialog({
+    title: '担当者を追加',
+    body: [h('label', { class: 'f' }, '名前', name), h('p', { class: 'sub' }, '施術を担当した人を登録します。名前の変更や整理は「リスト」→「担当者」でできます。')],
+    footer: [h('button', { class: 'btn', onclick: () => dlg.close() }, 'やめる'), h('button', { class: 'btn primary', onclick: save }, '追加')],
+    onClose: render,
+  });
 }
 
 function pickSymptoms(v) {
@@ -413,12 +456,13 @@ function pickTsubo(v) {
 }
 
 /* ---------- 統計 ---------- */
-const stats = { mode: 'symptom', symptomId: undefined, tsuboId: undefined, period: 'all', sort: 'good', place: 'all' };
+const stats = { mode: 'symptom', symptomId: undefined, tsuboId: undefined, period: 'all', sort: 'good', place: 'all', staff: 'all' };
 function viewStats() {
   const from = stats.period === 'all' ? null : (() => { const d = new Date(); d.setMonth(d.getMonth() - Number(stats.period)); return ymd(d); })();
   if (!db.places.has(stats.place)) stats.place = 'all';
   const inPlace = v => { const p = db.patients.get(v.patientId); return stats.place === 'all' || (p && placeOf(p) === stats.place); };
-  const visits = [...db.visits.values()].filter(v => (!from || v.date >= from) && inPlace(v));
+  if (!db.staff.has(stats.staff)) stats.staff = 'all';
+  const visits = [...db.visits.values()].filter(v => (!from || v.date >= from) && inPlace(v) && (stats.staff === 'all' || v.staffId === stats.staff));
   const rows = flatten(visits);
   const set = (k, val) => { stats[k] = val; render(); };
   const head = [
@@ -428,10 +472,12 @@ function viewStats() {
       h('div', null, h('b', null, new Set(visits.map(v => v.patientId)).size), h('span', null, '患者')),
       h('div', null, h('b', null, visits.length), h('span', null, '来院')),
       h('div', null, h('b', null, rows.length), h('span', null, 'ツボ（のべ）'))),
-    db.places.size > 1 ? h('select', { 'aria-label': '場所', onchange: e => set('place', e.target.value) }, [['all', 'すべての場所'], ...places().map(pl => [pl.id, pl.name])].map(([val, l]) => h('option', { value: val, selected: stats.place === val }, l))) : null,
+    db.places.size > 1 || db.staff.size > 1 ? h('div', { class: 'row' },
+      db.places.size > 1 ? h('div', { class: 'grow' }, h('select', { 'aria-label': '場所', onchange: e => set('place', e.target.value) }, [['all', 'すべての場所'], ...places().map(pl => [pl.id, pl.name])].map(([val, l]) => h('option', { value: val, selected: stats.place === val }, l)))) : null,
+      db.staff.size > 1 ? h('div', { class: 'grow' }, h('select', { 'aria-label': '担当者', onchange: e => set('staff', e.target.value) }, [['all', 'すべての担当者'], ...[...db.staff.values()].sort((a, b) => a.created - b.created).map(s => [s.id, s.name])].map(([val, l]) => h('option', { value: val, selected: stats.staff === val }, l)))) : null) : null,
   ];
   const period = h('select', { 'aria-label': '期間', onchange: e => set('period', e.target.value) }, [['all', '全期間'], ['3', '直近3か月'], ['12', '直近1年']].map(([val, l]) => h('option', { value: val, selected: stats.period === val }, l)));
-  if (!rows.length) return [...head, period, h('p', { class: 'empty' }, 'この期間の記録がまだありません。施術を記録すると、ここに集計が出ます。')];
+  if (!rows.length) return [...head, period, h('p', { class: 'empty' }, stats.place !== 'all' || stats.staff !== 'all' ? 'この条件に当てはまる記録がまだありません。' : 'この期間の記録がまだありません。施術を記録すると、ここに集計が出ます。')];
 
   const bySym = stats.mode === 'symptom';
   const keyOf = r => (bySym ? r.symptomId : r.tsuboId), otherOf = r => (bySym ? r.tsuboId : r.symptomId);
@@ -465,9 +511,10 @@ function viewStats() {
   ];
 }
 
-/* ---------- リスト（ツボ・症状） ---------- */
+/* ---------- リスト（ツボ・症状・担当者・場所） ---------- */
 let listKind = 'tsubo';
-const listSeg = () => h('div', { class: 'seg' }, [['tsubo', `ツボ（${db.tsubo.size}）`], ['symptoms', `症状（${db.symptoms.size}）`], ['places', `場所（${db.places.size}）`]].map(([k, l]) => h('button', { class: 'btn', 'aria-pressed': String(listKind === k), onclick: () => { listKind = k; render(); } }, l)));
+const LIST_WORD = { tsubo: 'ツボ', symptoms: '症状', staff: '担当者' };
+const listSeg = () => h('div', { class: 'seg' }, [['tsubo', `ツボ（${db.tsubo.size}）`], ['symptoms', `症状（${db.symptoms.size}）`], ['staff', `担当者（${db.staff.size}）`], ['places', `場所（${db.places.size}）`]].map(([k, l]) => h('button', { class: 'btn', 'aria-pressed': String(listKind === k), onclick: () => { listKind = k; render(); } }, l)));
 function viewPlaces() {
   const count = new Map();
   for (const p of db.patients.values()) count.set(placeOf(p), (count.get(placeOf(p)) || 0) + 1);
@@ -484,19 +531,20 @@ function viewPlaces() {
 }
 function viewLists() {
   if (listKind === 'places') return viewPlaces();
-  const isT = listKind === 'tsubo';
-  const word = isT ? 'ツボ' : '症状';
-  const used = new Map();
+  const kind = listKind, isT = kind === 'tsubo';
+  const word = LIST_WORD[kind];
+  const used = new Map(), count = id => used.set(id, (used.get(id) || 0) + 1);
   for (const v of db.visits.values()) {
-    if (isT) for (const r of v.rows) used.set(r.tsuboId, (used.get(r.tsuboId) || 0) + 1);
-    else for (const s of v.symptoms) used.set(s, (used.get(s) || 0) + 1);
+    if (isT) for (const r of v.rows) count(r.tsuboId);
+    else if (kind === 'symptoms') for (const s of v.symptoms) count(s);
+    else if (v.staffId) count(v.staffId);
   }
-  const items = [...db[isT ? 'tsubo' : 'symptoms'].values()].sort((a, b) => (a.archived - b.archived) || (isT ? (a.group || '').localeCompare(b.group || '', 'ja') || byName(a, b) : a.created - b.created));
+  const items = [...db[kind].values()].sort((a, b) => (a.archived - b.archived) || (isT ? (a.group || '').localeCompare(b.group || '', 'ja') || byName(a, b) : a.created - b.created));
   const name = h('input', { type: 'text', placeholder: `新しい${word}の名前`, autocomplete: 'off' });
   const add = async () => {
     const t = name.value.trim(); if (!t) return;
     if (items.some(x => x.name === t)) { toast(`「${t}」はすでにあります`); return; }
-    await put(isT ? 'tsubo' : 'symptoms', isT ? { id: uid(), name: t, yomi: '', group: '', archived: false, created: Date.now() } : { id: uid(), name: t, archived: false, created: Date.now() });
+    await put(kind, isT ? { id: uid(), name: t, yomi: '', group: '', archived: false, created: Date.now() } : { id: uid(), name: t, archived: false, created: Date.now() });
     render();
   };
   name.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) add(); });
@@ -504,23 +552,24 @@ function viewLists() {
     topbar('リスト'),
     listSeg(),
     h('div', { class: 'card' },
+      kind === 'staff' ? h('p', { class: 'sub' }, '施術を担当した人のリストです。来院の記録で選ぶと、だれが担当したかが残り、統計を担当者でしぼれます。') : null,
       h('div', { class: 'row' }, h('div', { class: 'grow' }, name), h('button', { class: 'btn primary', onclick: add }, '追加')),
-      h('button', { class: 'btn small', style: 'align-self:flex-start', onclick: () => bulkAdd(isT) }, 'まとめて追加')),
-    items.length ? h('ul', { class: 'list' }, items.map(x => h('li', null, h('button', { class: 'item' + (x.archived ? ' off' : ''), onclick: () => editItem(isT, x, used.get(x.id) || 0) },
+      h('button', { class: 'btn small', style: 'align-self:flex-start', onclick: () => bulkAdd(kind) }, 'まとめて追加')),
+    items.length ? h('ul', { class: 'list' }, items.map(x => h('li', null, h('button', { class: 'item' + (x.archived ? ' off' : ''), onclick: () => editItem(kind, x, used.get(x.id) || 0) },
       h('span', { class: 'ttl' }, x.name, x.yomi ? h('small', null, x.yomi) : null, x.group ? h('span', { class: 'tag' }, x.group) : null),
       h('span', { class: 'sub' }, (x.archived ? '使わない（選ぶ画面に出ません）・' : '') + (used.get(x.id) ? `記録 ${used.get(x.id)}回` : 'まだ使っていません'))))))
       : h('p', { class: 'empty' }, `まだ${word}がありません。上の欄から追加してください。`),
   ];
 }
-function editItem(isT, x, usedCount) {
-  const kind = isT ? 'tsubo' : 'symptoms';
+function editItem(kind, x, usedCount) {
+  const isT = kind === 'tsubo';
   const name = h('input', { type: 'text', value: x.name, autocomplete: 'off' });
   const yomi = h('input', { type: 'text', value: x.yomi || '', placeholder: 'ひらがな（さがすときに使います）', autocomplete: 'off' });
   const group = h('input', { type: 'text', value: x.group || '', list: 'groups', placeholder: '例：下肢、背部', autocomplete: 'off' });
   const groups = h('datalist', { id: 'groups' }, [...new Set([...db.tsubo.values()].map(t => t.group).filter(Boolean))].map(g => h('option', { value: g })));
   const off = h('input', { type: 'checkbox', checked: !!x.archived });
   const dlg = openDialog({
-    title: isT ? 'ツボ' : '症状',
+    title: LIST_WORD[kind],
     body: [
       h('label', { class: 'f' }, '名前', name),
       isT ? h('label', { class: 'f' }, 'よみ', yomi) : null,
@@ -540,11 +589,11 @@ function editItem(isT, x, usedCount) {
     onClose: render,
   });
 }
-function bulkAdd(isT) {
-  const kind = isT ? 'tsubo' : 'symptoms';
-  const ta = h('textarea', { style: 'min-height:200px', placeholder: isT ? '申脈\n承山, しょうざん, 下肢\n膝伝' : '上腕のだるさ\nしびれ' });
+function bulkAdd(kind) {
+  const isT = kind === 'tsubo';
+  const ta = h('textarea', { style: 'min-height:200px', placeholder: isT ? '申脈\n承山, しょうざん, 下肢\n膝伝' : kind === 'staff' ? '1行に1人ずつ' : '上腕のだるさ\nしびれ' });
   const dlg = openDialog({
-    title: `${isT ? 'ツボ' : '症状'}をまとめて追加`,
+    title: `${LIST_WORD[kind]}をまとめて追加`,
     body: [h('p', { class: 'sub' }, isT ? '1行に1つ書きます。「名前, よみ, グループ」のようにカンマで区切ると、よみとグループも入ります（名前だけでもよい）。すでにある名前は飛ばします。' : '1行に1つ書きます。すでにある名前は飛ばします。'), ta],
     footer: [h('button', { class: 'btn', onclick: () => dlg.close() }, 'やめる'), h('button', { class: 'btn primary', onclick: async () => {
       const have = new Set([...db[kind].values()].map(o => o.name));
@@ -578,11 +627,11 @@ async function saveFile(name, text, type) {
 const stamp = () => today().replace(/-/g, '');
 function toCsv() {
   const q = s => '"' + String(s == null ? '' : s).replace(/"/g, '""') + '"';
-  const lines = [['日付', '場所', '患者', '回数', '症状', 'ツボ', '左右', 'ねらい', '効果'].map(q).join(',')];
+  const lines = [['日付', '場所', '患者', '担当者', '回数', '症状', 'ツボ', '左右', 'ねらい', '効果'].map(q).join(',')];
   const idx = visitsByPatient();
   for (const v of [...db.visits.values()].sort(visitOrder)) {
     const p = db.patients.get(v.patientId), n = (idx.get(v.patientId) || []).indexOf(v) + 1;
-    for (const r of v.rows) lines.push([v.date, p ? db.places.get(placeOf(p)).name : '', p ? p.name || p.no || '' : '', n, r.symptomId ? symptomName(r.symptomId) : '', tsuboName(r.tsuboId), sideLabel(r.side) === '中' ? '' : sideLabel(r.side), r.aim || '', effectMark(r.effect)].map(q).join(','));
+    for (const r of v.rows) lines.push([v.date, p ? db.places.get(placeOf(p)).name : '', p ? p.name || p.no || '' : '', db.staff.has(v.staffId) ? staffName(v.staffId) : '', n, r.symptomId ? symptomName(r.symptomId) : '', tsuboName(r.tsuboId), sideLabel(r.side) === '中' ? '' : sideLabel(r.side), r.aim || '', effectMark(r.effect)].map(q).join(','));
   }
   return '﻿' + lines.join('\r\n');
 }
@@ -593,9 +642,9 @@ function viewSettings() {
     if (!f) return;
     let data;
     try { data = JSON.parse(await f.text()); if (data.app !== 'tsubo-kiroku') throw new Error('format'); } catch (err) { toast('ツボ記録の控えファイルではないようです'); return; }
-    const kinds = ['places', 'patients', 'visits', 'tsubo', 'symptoms'];
+    const kinds = DATA_KINDS;
     const count = k => (Array.isArray(data[k]) ? data[k].length : 0);
-    if (!await confirmDialog(`控えを読み込みます。\n患者 ${count('patients')}人・来院 ${count('visits')}回・ツボ ${count('tsubo')}個・症状 ${count('symptoms')}個\n\nいまの記録は残したまま足します。同じ記録がある場合は、控えの内容で上書きします。`, '読み込む')) return;
+    if (!await confirmDialog(`控えを読み込みます。\n患者 ${count('patients')}人・来院 ${count('visits')}回・ツボ ${count('tsubo')}個・症状 ${count('symptoms')}個${count('staff') ? `・担当者 ${count('staff')}人` : ''}\n\nいまの記録は残したまま足します。同じ記録がある場合は、控えの内容で上書きします。`, '読み込む')) return;
     const byKind = {};
     for (const k of kinds) byKind[k] = (Array.isArray(data[k]) ? data[k] : []).filter(o => o && typeof o.id === 'string');
     try { await store.putMany(byKind); } catch (err) { console.error(err); toast('読み込めませんでした'); return; }
@@ -611,7 +660,7 @@ function viewSettings() {
       h('p', { class: 'sub' }, lastBackup ? `最後に書き出した日：${fmtDate(ymd(new Date(lastBackup)))}` : 'まだ書き出していません。'),
       h('button', { class: 'btn primary', onclick: async () => {
         const data = { app: 'tsubo-kiroku', version: 1, exported: new Date().toISOString() };
-        for (const k of ['places', 'patients', 'visits', 'tsubo', 'symptoms']) data[k] = [...db[k].values()];
+        for (const k of DATA_KINDS) data[k] = [...db[k].values()];
         if (await saveFile(`ツボ記録-控え-${stamp()}.json`, JSON.stringify(data), 'application/json')) { await metaSet('lastBackup', Date.now()); render(); }
       } }, '控えを書き出す'),
       h('button', { class: 'btn', onclick: () => file.click() }, '控えを読み込む'), file),
@@ -625,7 +674,7 @@ function viewSettings() {
 
 /* ---------- 同期（クラウド） ---------- */
 // ログインすると、記録の置き場所が「端末の中」から「クラウド」に変わる。端末ごとの設定（いま開いている場所・控えの日付など）は端末に残す。
-const DATA_KINDS = ['places', 'patients', 'visits', 'tsubo', 'symptoms'];
+const DATA_KINDS = ['places', 'patients', 'visits', 'tsubo', 'symptoms', 'staff'];
 const isLocalhost = ['localhost', '127.0.0.1'].includes(location.hostname);
 let localStore, cloud = null, cloudFailed = false, user = null, syncError = '', needRender = false, unsubs = [];
 async function loadCloud() {
@@ -652,9 +701,9 @@ async function mergeLocalIntoCloud(me) {
   const remote = {}, local = {};
   for (const k of DATA_KINDS) remote[k] = await cloud.fetch(me, k);          // ルールが未設定なら、ここで断られる
   for (const k of DATA_KINDS) local[k] = [...db[k].values()].map(o => JSON.parse(JSON.stringify(o)));
-  // 同じ名前の場所・ツボ・症状がクラウドにあれば、そちらを使う（端末ごとに同じものが二重にならないように）
+  // 同じ名前の場所・ツボ・症状・担当者がクラウドにあれば、そちらを使う（端末ごとに同じものが二重にならないように）
   const remap = {};
-  for (const k of ['places', 'tsubo', 'symptoms']) {
+  for (const k of ['places', 'tsubo', 'symptoms', 'staff']) {
     const ids = new Set(remote[k].map(o => o.id)), byNm = new Map(remote[k].map(o => [o.name, o.id]));
     remap[k] = new Map(local[k].filter(o => !ids.has(o.id) && byNm.has(o.name)).map(o => [o.id, byNm.get(o.name)]));
   }
@@ -664,6 +713,7 @@ async function mergeLocalIntoCloud(me) {
   for (const p of local.patients) p.placeId = to('places', known.has(p.placeId) ? p.placeId : first.id);
   for (const v of local.visits) {
     v.symptoms = [...new Set((v.symptoms || []).map(x => to('symptoms', x)))];
+    if (v.staffId) v.staffId = to('staff', v.staffId);
     for (const r of v.rows || []) { r.tsuboId = to('tsubo', r.tsuboId); if (r.symptomId) r.symptomId = to('symptoms', r.symptomId); }
   }
   const usedPlaces = new Set(local.patients.map(p => p.placeId));

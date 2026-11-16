@@ -6,6 +6,7 @@
 //   kiroku/{本人のID}/visits/{id}    来院の記録（使ったツボ・効果を含む）
 //   kiroku/{本人のID}/tsubo/{id}     ツボのリスト
 //   kiroku/{本人のID}/symptoms/{id}  症状のリスト
+//   kiroku/{本人のID}/staff/{id}     担当者のリスト
 // 読み書きできるのは、ツボマップ3D の管理者（owner）本人のログインだけ。Firebase 側のルールで守る（ツボマップ3D と同じ Firebase なので、ルールは1つ。README を参照）。
 export const SDK_VERSION = '12.15.0';
 const BASE = `https://www.gstatic.com/firebasejs/${SDK_VERSION}/`;

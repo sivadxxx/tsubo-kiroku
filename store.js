@@ -1,8 +1,8 @@
 // 記録の保存先。いまは、この端末の中（IndexedDB）だけに保存する。
 // 画面側は loadAll / put / del / putMany しか使わないので、あとで保存先（クラウドなど）を足すときは、ここだけ差し替えればよい。
 const DB = 'tsubo-kiroku';
-const VER = 2;                                  // 2：場所（places）を追加
-export const KINDS = ['patients', 'visits', 'tsubo', 'symptoms', 'places', 'meta'];
+const VER = 3;                                  // 2：場所（places）を追加　3：担当者（staff）を追加
+export const KINDS = ['patients', 'visits', 'tsubo', 'symptoms', 'places', 'staff', 'meta'];
 
 // onBlocked：ほかのタブが古い版のまま開いていて、保存場所の作り替えを待たされているときに呼ぶ（そのタブが閉じられると、自動で先へ進む）
 // onStale：ほかのタブが新しい版で開かれ、このタブが古くなったときに呼ぶ
@@ -36,7 +36,7 @@ export async function openStore({ onBlocked, onStale } = {}) {
     del: (kind, id) => write(t => t.objectStore(kind).delete(id)),
     putMany: byKind => write(t => { for (const k of Object.keys(byKind)) for (const o of byKind[k]) t.objectStore(k).put(o); }),
     delMany: byKind => write(t => { for (const k of Object.keys(byKind)) for (const id of byKind[k]) t.objectStore(k).delete(id); }),
-    // 記録（患者・来院・ツボ・症状・場所）をすべて消す。クラウドに移し終えたあとに使う。端末ごとの設定（meta）は残す
+    // 記録（患者・来院・ツボ・症状・場所・担当者）をすべて消す。クラウドに移し終えたあとに使う。端末ごとの設定（meta）は残す
     clearData: () => write(t => { for (const k of KINDS) if (k !== 'meta') t.objectStore(k).clear(); }),
   };
 }
