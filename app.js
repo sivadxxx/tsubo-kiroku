@@ -4,7 +4,7 @@ import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 import { createCloud, explain } from './cloud-firebase.js';
 import { firebaseConfig } from './config.js';
 
-const VERSION = '1.6';
+const VERSION = '1.7';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -39,6 +39,11 @@ function fmtDate(s) {
 // 検索用：全角半角・大文字小文字・カタカナひらがなの違いをなくす
 const norm = s => (s || '').normalize('NFKC').toLowerCase().replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60)).replace(/\s+/g, '');
 const byName = (a, b) => a.name.localeCompare(b.name, 'ja');
+const byCreated = (a, b) => a.created - b.created;
+// 「リスト」で自分で並べた順（order）。まだ並べていないものは後ろに回し、rest の順で並べる
+const ord = x => (typeof x.order === 'number' ? x.order : Infinity);
+const byOrder = rest => (a, b) => (ord(a) === ord(b) ? rest(a, b) : ord(a) - ord(b));
+const tsuboOrder = byOrder((a, b) => (a.group || '').localeCompare(b.group || '', 'ja') || byName(a, b));      // 並べていないツボは、グループ → 名前の順
 function debounce(fn, ms) { let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; }
 let toastTimer;
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 2600); }
@@ -78,7 +83,7 @@ const staffName = id => (db.staff.get(id) || { name: '（消した担当者）' 
 const staffPlaces = s => (Array.isArray(s.placeIds) ? s.placeIds : s.placeId ? [s.placeId] : []).filter(id => db.places.has(id));
 const setStaffPlaces = (s, ids) => { s.placeIds = places().map(pl => pl.id).filter(id => ids.includes(id)); delete s.placeId; };
 const inStaffPlace = (s, placeId) => { const ps = staffPlaces(s); return !placeId || !ps.length || ps.includes(placeId); };
-const activeStaff = placeId => [...db.staff.values()].filter(s => !s.archived && inStaffPlace(s, placeId)).sort((a, b) => a.created - b.created);
+const activeStaff = placeId => [...db.staff.values()].filter(s => !s.archived && inStaffPlace(s, placeId)).sort(byOrder(byCreated));
 // 新しい記録に最初から入れておく担当者：この患者の前回の担当者 → この端末で最後に選んだ担当者 → 1人しかいなければその人
 function defaultStaff(last, placeId) {
   const act = activeStaff(placeId), ok = id => act.some(s => s.id === id);
@@ -119,6 +124,80 @@ function confirmDialog(message, okLabel = 'OK', danger = false) {
       onClose: () => res(ok),
     });
   });
+}
+
+/* ---------- ドラッグでの並べ替え ---------- */
+// ul の中の、data-id の付いた行を、つまみ（.grip）を引いて並べ替えられるようにする。指でもマウスでも同じ。
+// 並びが変わったら onDone(並んだ順の id, キーで動かした行の id) を呼ぶ
+let dragging = false;
+function sortable(ul, onDone) {
+  let d = null;
+  const ids = () => [...ul.children].filter(li => li.dataset.id).map(li => li.dataset.id);
+  const slide = (li, from) => {      // 場所をゆずった行を、元の位置からすべらせる
+    li.style.transition = 'none'; li.style.transform = `translateY(${from - li.offsetTop}px)`;
+    li.offsetHeight;
+    li.style.transition = 'transform .15s'; li.style.transform = '';
+  };
+  const place = () => {
+    const { li } = d, rows = [...ul.children].filter(x => x.dataset.id), last = rows[rows.length - 1];
+    // 行の上の端を置きたい位置（リストの外には出さない）
+    const top = Math.max(rows[0].offsetTop, Math.min(last.offsetTop + last.offsetHeight - li.offsetHeight, d.top0 + (d.y - d.y0) + (window.scrollY - d.sy0)));
+    const mid = top + li.offsetHeight / 2;
+    // 引いている行そのものは動かさず（動かすと指を離したことになる）、通りすぎた行のほうを反対側へ移す
+    for (;;) {
+      const prev = li.previousElementSibling, next = li.nextElementSibling;
+      if (prev && prev.dataset.id && mid <= prev.offsetTop + prev.offsetHeight / 2) { const t = prev.offsetTop; li.after(prev); slide(prev, t); }
+      else if (next && next.dataset.id && mid >= next.offsetTop + next.offsetHeight / 2) { const t = next.offsetTop; li.before(next); slide(next, t); }
+      else break;
+    }
+    li.style.transform = `translateY(${top - li.offsetTop}px)`;
+  };
+  const tick = () => {               // 画面の上下の端まで引いたら、リストを送る（下はタブの分だけ手前から）。端に近いほど速く
+    if (!ul.isConnected) { clearInterval(d.timer); d = null; dragging = false; return; }      // 引いているあいだに画面が変わった
+    const now = performance.now();
+    const over = d.y < 80 ? d.y - 80 : d.y > innerHeight - 140 ? d.y - (innerHeight - 140) : 0;
+    const dt = Math.min(100, now - (d.t || now)); d.t = now;
+    d.acc = over ? (d.acc || 0) + Math.max(-900, Math.min(900, over * 14)) * dt / 1000 : 0;      // 1px に満たない分は、次に回す
+    const step = Math.trunc(d.acc);
+    if (step) { d.acc -= step; window.scrollBy(0, step); place(); }
+  };
+  const end = e => {
+    if (!d || e.pointerId !== d.id) return;
+    clearInterval(d.timer);
+    const { li, before } = d;
+    d = null; dragging = false;
+    li.classList.remove('dragging'); li.style.transform = ''; li.style.transition = '';
+    if (ids().join() !== before) onDone(ids());
+    else if (needRender && !busy()) render();
+  };
+  ul.addEventListener('pointerdown', e => {
+    const grip = e.target.closest('.grip');
+    if (!grip || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    if (d) end({ pointerId: d.id });      // 前のドラッグが終わりそこねていたら、ここで終わらせる
+    const li = grip.closest('li');
+    e.preventDefault();
+    try { grip.setPointerCapture(e.pointerId); } catch (err) {}
+    d = { li, id: e.pointerId, y0: e.clientY, y: e.clientY, sy0: window.scrollY, top0: li.offsetTop, before: ids().join() };
+    dragging = true;
+    li.style.transition = 'none';
+    li.classList.add('dragging');
+    d.timer = setInterval(tick, 16);
+  });
+  ul.addEventListener('pointermove', e => { if (d && e.pointerId === d.id) { d.y = e.clientY; place(); } });
+  ul.addEventListener('pointerup', end);
+  ul.addEventListener('pointercancel', end);
+  ul.addEventListener('lostpointercapture', end);
+  // キーボード：つまみに合わせて、上下の矢印キーで1つずつ動かす
+  ul.addEventListener('keydown', e => {
+    const grip = e.target.closest('.grip');
+    if (!grip || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+    e.preventDefault();
+    const li = grip.closest('li'), other = e.key === 'ArrowUp' ? li.previousElementSibling : li.nextElementSibling;
+    if (!other || !other.dataset.id) return;
+    if (e.key === 'ArrowUp') other.before(li); else other.after(li);
+    onDone(ids(), li.dataset.id);
+  });
+  return ul;
 }
 
 /* ---------- 画面の切り替え ---------- */
@@ -311,7 +390,7 @@ function viewVisit(id) {
   const saveSoon = debounce(save, 500);
   const change = async () => { await save(); render(); };
   const multi = v.symptoms.length >= 2;
-  // 担当者：この場所で使える人を登録した順に。いまは使わない人・ほかの場所の人でも、この記録に入っていれば出す
+  // 担当者：この場所で使える人を「リスト」の順に。いまは使わない人・ほかの場所の人でも、この記録に入っていれば出す
   const staffList = activeStaff(p ? placeOf(p) : null);
   if (db.staff.has(v.staffId) && !staffList.some(s => s.id === v.staffId)) staffList.push(db.staff.get(v.staffId));
   const staffEl = h('div', { class: 'chips', role: 'group', 'aria-label': '担当者' },
@@ -398,8 +477,8 @@ function pickSymptoms(v) {
   const usedByPatient = new Set(visitsOf(v.patientId).flatMap(x => x.symptoms));
   const chips = h('div', { class: 'chips' });
   const draw = () => {
-    // この患者で使ったことのある症状を先に。あとは登録した順（最初は問診票の並び）
-    const list = activeSymptoms().sort((a, b) => (usedByPatient.has(b.id) - usedByPatient.has(a.id)) || a.created - b.created);
+    // この患者で使ったことのある症状を先に。あとは「リスト」の順（並べていなければ登録した順。最初は問診票の並び）
+    const list = activeSymptoms().sort((a, b) => (usedByPatient.has(b.id) - usedByPatient.has(a.id)) || byOrder(byCreated)(a, b));
     chips.replaceChildren(...list.map(s => h('button', { class: 'chip', 'aria-pressed': String(v.symptoms.includes(s.id)), onclick: async () => {
       v.symptoms = v.symptoms.includes(s.id) ? v.symptoms.filter(x => x !== s.id) : [...v.symptoms, s.id];
       fixRows(v); await put('visits', v); draw();
@@ -421,6 +500,8 @@ function pickSymptoms(v) {
 
 function pickTsubo(v) {
   let q = '', group = '';
+  // 並び：効いた順（これまでの記録から）か、「リスト」で並べた順か。リストを並べ替えてあれば、まずはリストの順にする
+  let sortBy = metaGet('pickSort') || ([...db.tsubo.values()].some(t => typeof t.order === 'number') ? 'list' : 'good');
   let target = v.symptoms.length ? ((v.rows[v.rows.length - 1] || {}).symptomId || v.symptoms[0]) : null;
   // これまでの記録（この来院を除く）から、よく使う順・この症状で効いた順に並べる
   const rows = flatten([...db.visits.values()].filter(x => x.id !== v.id));
@@ -430,7 +511,9 @@ function pickTsubo(v) {
   rescore();
 
   const targetEl = h('div', { class: 'chips' }), groupEl = h('div', { class: 'chips' }), listEl = h('div', null);
-  const search = h('input', { type: 'search', placeholder: 'ツボの名前でさがす・追加する', autocomplete: 'off', oninput: e => { q = e.target.value; draw(); } });
+  const search = h('input', { type: 'search', placeholder: '名前でさがす・追加する', autocomplete: 'off', oninput: e => { q = e.target.value; draw(); } });
+  const sortSel = h('select', { 'aria-label': '並び順', style: 'width:auto;flex:none', onchange: async e => { sortBy = e.target.value; draw(); await metaSet('pickSort', sortBy); } },
+    [['good', '効いた順'], ['list', 'リストの順']].map(([val, l]) => h('option', { value: val, selected: sortBy === val }, l)));
   const toggle = async (t, side) => {
     const i = v.rows.findIndex(r => r.tsuboId === t.id && (r.side || '') === side);
     if (i < 0) v.rows.push({ tsuboId: t.id, side, symptomId: target, aim: '', effect: null });
@@ -440,13 +523,13 @@ function pickTsubo(v) {
   };
   const draw = () => {
     targetEl.replaceChildren(...(v.symptoms.length >= 2 ? v.symptoms.map(s => h('button', { class: 'chip', 'aria-pressed': String(s === target), onclick: () => { target = s; rescore(); draw(); } }, symptomName(s) + ' に対して')) : []));
-    const groups = [...new Set(activeTsubo().map(t => t.group).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ja'));
+    const groups = [...new Set(activeTsubo().sort(tsuboOrder).map(t => t.group).filter(Boolean))];      // グループも「リスト」に出てくる順
     if (group && !groups.includes(group)) group = '';
     groupEl.replaceChildren(...(groups.length ? [h('button', { class: 'chip', 'aria-pressed': String(!group), onclick: () => { group = ''; draw(); } }, 'すべて'), ...groups.map(g => h('button', { class: 'chip', 'aria-pressed': String(g === group), onclick: () => { group = g; draw(); } }, g))] : []));
     const nq = norm(q);
     const list = activeTsubo()
       .filter(t => (!group || t.group === group) && (!nq || norm(t.name).includes(nq) || norm(t.yomi).includes(nq)))
-      .sort((a, b) => (goodHere.get(b.id) || 0) - (goodHere.get(a.id) || 0) || (usedAll.get(b.id) || 0) - (usedAll.get(a.id) || 0) || byName(a, b));
+      .sort(sortBy === 'list' ? tsuboOrder : (a, b) => (goodHere.get(b.id) || 0) - (goodHere.get(a.id) || 0) || (usedAll.get(b.id) || 0) - (usedAll.get(a.id) || 0) || byOrder(byName)(a, b));
     const exact = [...db.tsubo.values()].find(t => norm(t.name) === nq);
     listEl.replaceChildren(...[
       ...list.map(t => h('div', { class: 'pick' },
@@ -460,7 +543,7 @@ function pickTsubo(v) {
     ].filter(Boolean));
   };
   draw();
-  openDialog({ title: 'ツボを選ぶ', full: true, body: [search, targetEl, groupEl, h('p', { class: 'sub' }, 'L＝左　R＝右　両＝両側　中＝正中・左右なし（もう一度押すと取り消し）'), listEl], onClose: render });
+  openDialog({ title: 'ツボを選ぶ', full: true, body: [h('div', { class: 'row' }, h('div', { class: 'grow' }, search), sortSel), targetEl, groupEl, h('p', { class: 'sub' }, 'L＝左　R＝右　両＝両側　中＝正中・左右なし（もう一度押すと取り消し）'), listEl], onClose: render });
 }
 
 /* ---------- 統計 ---------- */
@@ -469,7 +552,7 @@ function viewStats() {
   const from = stats.period === 'all' ? null : (() => { const d = new Date(); d.setMonth(d.getMonth() - Number(stats.period)); return ymd(d); })();
   if (!db.places.has(stats.place)) stats.place = 'all';
   const inPlace = v => { const p = db.patients.get(v.patientId); return stats.place === 'all' || (p && placeOf(p) === stats.place); };
-  const staffOpts = [...db.staff.values()].filter(s => inStaffPlace(s, stats.place === 'all' ? null : stats.place)).sort((a, b) => a.created - b.created);      // 場所でしぼっているときは、その場所の担当者だけ
+  const staffOpts = [...db.staff.values()].filter(s => inStaffPlace(s, stats.place === 'all' ? null : stats.place)).sort(byOrder(byCreated));      // 場所でしぼっているときは、その場所の担当者だけ
   if (!staffOpts.some(s => s.id === stats.staff)) stats.staff = 'all';
   const visits = [...db.visits.values()].filter(v => (!from || v.date >= from) && inPlace(v) && (stats.staff === 'all' || v.staffId === stats.staff));
   const rows = flatten(visits);
@@ -549,11 +632,14 @@ function viewLists() {
     else if (kind === 'symptoms') for (const s of v.symptoms) count(s);
     else if (v.staffId) count(v.staffId);
   }
-  const items = [...db[kind].values()].sort((a, b) => (a.archived - b.archived) || (isT ? (a.group || '').localeCompare(b.group || '', 'ja') || byName(a, b) : a.created - b.created));
   const isS = kind === 'staff', multi = db.places.size > 1;
+  // 自分で並べた順。並べていないものは、ツボはグループ → 名前、症状は登録した順、担当者は場所ごと（すべての場所の人が先）。使わないものは下に
+  const rank = s => places().findIndex(pl => pl.id === staffPlaces(s)[0]);
+  const rest = isT ? tsuboOrder : byOrder(isS ? (a, b) => rank(a) - rank(b) || byCreated(a, b) : byCreated);
+  const items = [...db[kind].values()].sort((a, b) => (a.archived - b.archived) || rest(a, b));
+  const canSort = items.filter(x => !x.archived).length > 1;
   if (staffPlace === undefined || (staffPlace && !db.places.has(staffPlace))) staffPlace = curPlace().id;
   const placeSel = isS && multi ? h('select', { onchange: e => { staffPlace = e.target.value; } }, [...places().map(pl => [pl.id, pl.name]), ['', 'すべての場所']].map(([val, l]) => h('option', { value: val, selected: staffPlace === val }, l))) : null;
-  if (isS) { const rank = s => places().findIndex(pl => pl.id === staffPlaces(s)[0]); items.sort((a, b) => (a.archived - b.archived) || rank(a) - rank(b) || a.created - b.created); }      // 場所ごとにまとめる（すべての場所の人が先）
   const name = h('input', { type: 'text', placeholder: `新しい${word}の名前`, autocomplete: 'off' });
   const add = async () => {
     const t = name.value.trim(); if (!t) return;
@@ -570,11 +656,23 @@ function viewLists() {
       placeSel ? h('label', { class: 'f' }, '登録する場所', placeSel) : null,
       h('div', { class: 'row' }, h('div', { class: 'grow' }, name), h('button', { class: 'btn primary', onclick: add }, '追加')),
       h('button', { class: 'btn small', style: 'align-self:flex-start', onclick: () => bulkAdd(kind) }, 'まとめて追加')),
-    items.length ? h('ul', { class: 'list' }, items.map(x => h('li', null, h('button', { class: 'item' + (x.archived ? ' off' : ''), onclick: () => editItem(kind, x, used.get(x.id) || 0) },
-      h('span', { class: 'ttl' }, x.name, x.yomi ? h('small', null, x.yomi) : null, x.group ? h('span', { class: 'tag' }, x.group) : null, isS && multi ? (staffPlaces(x).length ? staffPlaces(x).map(id => h('span', { class: 'tag' }, db.places.get(id).name)) : h('span', { class: 'tag' }, 'すべての場所')) : null),
-      h('span', { class: 'sub' }, (x.archived ? '使わない（選ぶ画面に出ません）・' : '') + (used.get(x.id) ? `記録 ${used.get(x.id)}回` : 'まだ使っていません'))))))
+    canSort ? h('p', { class: 'sub' }, '右のつまみ（≡）を上下に引くと、並べ替えられます。' + (isT ? 'ツボを選ぶ画面で「リストの順」にすると、この順に並びます。' : isS ? '来院の記録でも、この順に並びます。' : '症状を選ぶ画面でも、この順に並びます（その患者で使ったことのある症状が先）。')) : null,
+    items.length ? sortable(h('ul', { class: 'list' }, items.map(x => h('li', { class: 'srow', 'data-id': x.archived || !canSort ? null : x.id },
+      h('button', { class: 'item' + (x.archived ? ' off' : ''), onclick: () => editItem(kind, x, used.get(x.id) || 0) },
+        h('span', { class: 'ttl' }, x.name, x.yomi ? h('small', null, x.yomi) : null, x.group ? h('span', { class: 'tag' }, x.group) : null, isS && multi ? (staffPlaces(x).length ? staffPlaces(x).map(id => h('span', { class: 'tag' }, db.places.get(id).name)) : h('span', { class: 'tag' }, 'すべての場所')) : null),
+        h('span', { class: 'sub' }, (x.archived ? '使わない（選ぶ画面に出ません）・' : '') + (used.get(x.id) ? `記録 ${used.get(x.id)}回` : 'まだ使っていません'))),
+      x.archived || !canSort ? null : h('button', { class: 'grip', 'aria-label': `${x.name} を並べ替える（上下の矢印キーでも動かせます）` })))), (ids, focusId) => reorder(kind, ids, focusId))
       : h('p', { class: 'empty' }, `まだ${word}がありません。上の欄から追加してください。`),
   ];
+}
+// 並べ替えた順を残す（順番の変わったものだけ書き込む）
+async function reorder(kind, ids, focusId) {
+  const changed = [];
+  ids.forEach((id, i) => { const x = db[kind].get(id); if (x && x.order !== i) { x.order = i; x.updated = Date.now(); changed.push(x); } });
+  try { await store.putMany({ [kind]: changed }); } catch (e) { console.error(e); toast('並び順を保存できませんでした'); }
+  render();
+  const grip = focusId && [...document.querySelectorAll('#view li[data-id]')].find(li => li.dataset.id === focusId);
+  if (grip) grip.querySelector('.grip').focus();
 }
 function editItem(kind, x, usedCount) {
   const isT = kind === 'tsubo';
@@ -719,7 +817,7 @@ function cloudStore(me) {
   };
 }
 // 入力の途中や、重ねた画面を開いているあいだは描き直さない（入力が途切れないように）。あとで描き直す
-const busy = () => !!document.querySelector('dialog[open]') || /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || '');
+const busy = () => dragging || !!document.querySelector('dialog[open]') || /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || '');
 function remoteChanged() { if (busy()) needRender = true; else render(); }
 
 // この端末の中の記録を、クラウドの記録に合わせて1つにまとめる。クラウドに届いたことを確かめてから、端末の中の記録を消す
