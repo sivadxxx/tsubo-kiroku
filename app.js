@@ -4,7 +4,7 @@ import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 import { createCloud, explain } from './cloud-firebase.js';
 import { firebaseConfig } from './config.js';
 
-const VERSION = '1.5';
+const VERSION = '1.6';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -72,10 +72,12 @@ const symptomName = id => (id == null ? '症状を選んでいない記録' : (d
 const activeTsubo = () => [...db.tsubo.values()].filter(t => !t.archived);
 const activeSymptoms = () => [...db.symptoms.values()].filter(s => !s.archived);
 // 担当者（施術をした人）。来院の記録ごとに1人選べる（選ばなくてもよい）。
-// 担当者は場所に属する（placeId）。場所の決まっていない担当者（placeId がない・その場所がもうない）は、すべての場所で選べる
+// 担当者は、出ている場所をいくつでも持てる（placeIds）。場所の決まっていない担当者（placeIds が空・その場所がもうない）は、すべての場所で選べる。
+// placeId は、場所を1つしか持てなかった版（1.5）の書き方。読むときだけ受け付ける
 const staffName = id => (db.staff.get(id) || { name: '（消した担当者）' }).name;
-const staffPlaceId = s => (s.placeId && db.places.has(s.placeId) ? s.placeId : null);
-const inStaffPlace = (s, placeId) => !placeId || !staffPlaceId(s) || staffPlaceId(s) === placeId;
+const staffPlaces = s => (Array.isArray(s.placeIds) ? s.placeIds : s.placeId ? [s.placeId] : []).filter(id => db.places.has(id));
+const setStaffPlaces = (s, ids) => { s.placeIds = places().map(pl => pl.id).filter(id => ids.includes(id)); delete s.placeId; };
+const inStaffPlace = (s, placeId) => { const ps = staffPlaces(s); return !placeId || !ps.length || ps.includes(placeId); };
 const activeStaff = placeId => [...db.staff.values()].filter(s => !s.archived && inStaffPlace(s, placeId)).sort((a, b) => a.created - b.created);
 // 新しい記録に最初から入れておく担当者：この患者の前回の担当者 → この端末で最後に選んだ担当者 → 1人しかいなければその人
 function defaultStaff(last, placeId) {
@@ -374,8 +376,8 @@ function addStaff(v) {
     const t = name.value.trim().replace(/\s+/g, ' ');
     if (!t) { toast('名前を入れてください'); return; }
     let s = [...db.staff.values()].find(x => x.name === t);
-    if (!s) s = { id: uid(), name: t, placeId, created: Date.now() };
-    else if (!inStaffPlace(s, placeId)) { s.placeId = null; toast(`「${t}」はほかの場所に登録されていたので、すべての場所で選べるようにしました`); }
+    if (!s) s = { id: uid(), name: t, placeIds: placeId ? [placeId] : [], created: Date.now() };
+    else if (!inStaffPlace(s, placeId)) { setStaffPlaces(s, [...staffPlaces(s), placeId]); toast(`「${t}」はほかの場所に登録されていたので、この場所でも選べるようにしました`); }
     s.archived = false;
     await put('staff', s);
     v.staffId = s.id;
@@ -551,12 +553,12 @@ function viewLists() {
   const isS = kind === 'staff', multi = db.places.size > 1;
   if (staffPlace === undefined || (staffPlace && !db.places.has(staffPlace))) staffPlace = curPlace().id;
   const placeSel = isS && multi ? h('select', { onchange: e => { staffPlace = e.target.value; } }, [...places().map(pl => [pl.id, pl.name]), ['', 'すべての場所']].map(([val, l]) => h('option', { value: val, selected: staffPlace === val }, l))) : null;
-  if (isS) { const rank = s => places().findIndex(pl => pl.id === staffPlaceId(s)); items.sort((a, b) => (a.archived - b.archived) || rank(a) - rank(b) || a.created - b.created); }      // 場所ごとにまとめる（すべての場所の人が先）
+  if (isS) { const rank = s => places().findIndex(pl => pl.id === staffPlaces(s)[0]); items.sort((a, b) => (a.archived - b.archived) || rank(a) - rank(b) || a.created - b.created); }      // 場所ごとにまとめる（すべての場所の人が先）
   const name = h('input', { type: 'text', placeholder: `新しい${word}の名前`, autocomplete: 'off' });
   const add = async () => {
     const t = name.value.trim(); if (!t) return;
     if (items.some(x => x.name === t)) { toast(`「${t}」はすでにあります`); return; }
-    await put(kind, isT ? { id: uid(), name: t, yomi: '', group: '', archived: false, created: Date.now() } : { id: uid(), name: t, ...(isS ? { placeId: staffPlace || null } : {}), archived: false, created: Date.now() });
+    await put(kind, isT ? { id: uid(), name: t, yomi: '', group: '', archived: false, created: Date.now() } : { id: uid(), name: t, ...(isS ? { placeIds: staffPlace ? [staffPlace] : [] } : {}), archived: false, created: Date.now() });
     render();
   };
   name.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) add(); });
@@ -564,12 +566,12 @@ function viewLists() {
     topbar('リスト'),
     listSeg(),
     h('div', { class: 'card' },
-      isS ? h('p', { class: 'sub' }, '施術を担当した人のリストです。来院の記録で選ぶと、だれが担当したかが残り、統計を担当者でしぼれます。' + (multi ? '担当者は場所ごとに分かれ、来院の記録では、その場所の担当者だけが出ます。' : '')) : null,
+      isS ? h('p', { class: 'sub' }, '施術を担当した人のリストです。来院の記録で選ぶと、だれが担当したかが残り、統計を担当者でしぼれます。' + (multi ? '来院の記録では、その場所に出ている担当者だけが並びます。複数の場所に出ている人は、追加したあとでその人を開くと、場所を足せます。' : '')) : null,
       placeSel ? h('label', { class: 'f' }, '登録する場所', placeSel) : null,
       h('div', { class: 'row' }, h('div', { class: 'grow' }, name), h('button', { class: 'btn primary', onclick: add }, '追加')),
       h('button', { class: 'btn small', style: 'align-self:flex-start', onclick: () => bulkAdd(kind) }, 'まとめて追加')),
     items.length ? h('ul', { class: 'list' }, items.map(x => h('li', null, h('button', { class: 'item' + (x.archived ? ' off' : ''), onclick: () => editItem(kind, x, used.get(x.id) || 0) },
-      h('span', { class: 'ttl' }, x.name, x.yomi ? h('small', null, x.yomi) : null, x.group ? h('span', { class: 'tag' }, x.group) : null, isS && multi ? h('span', { class: 'tag' }, staffPlaceId(x) ? db.places.get(x.placeId).name : 'すべての場所') : null),
+      h('span', { class: 'ttl' }, x.name, x.yomi ? h('small', null, x.yomi) : null, x.group ? h('span', { class: 'tag' }, x.group) : null, isS && multi ? (staffPlaces(x).length ? staffPlaces(x).map(id => h('span', { class: 'tag' }, db.places.get(id).name)) : h('span', { class: 'tag' }, 'すべての場所')) : null),
       h('span', { class: 'sub' }, (x.archived ? '使わない（選ぶ画面に出ません）・' : '') + (used.get(x.id) ? `記録 ${used.get(x.id)}回` : 'まだ使っていません'))))))
       : h('p', { class: 'empty' }, `まだ${word}がありません。上の欄から追加してください。`),
   ];
@@ -582,7 +584,13 @@ function editItem(kind, x, usedCount) {
   const groups = h('datalist', { id: 'groups' }, [...new Set([...db.tsubo.values()].map(t => t.group).filter(Boolean))].map(g => h('option', { value: g })));
   const off = h('input', { type: 'checkbox', checked: !!x.archived });
   const isS = kind === 'staff' && db.places.size > 1;
-  const place = h('select', null, [['', 'すべての場所'], ...places().map(pl => [pl.id, pl.name])].map(([val, l]) => h('option', { value: val, selected: (kind === 'staff' && staffPlaceId(x) || '') === val }, l)));
+  // 担当者の出ている場所（いくつでも）。どれも選ばなければ、すべての場所
+  const sel = new Set(kind === 'staff' ? staffPlaces(x) : []);
+  const place = h('div', { class: 'chips', role: 'group', 'aria-label': '場所' });
+  const drawPlaces = () => place.replaceChildren(
+    h('button', { class: 'chip', 'aria-pressed': String(!sel.size), onclick: () => { sel.clear(); drawPlaces(); } }, 'すべての場所'),
+    ...places().map(pl => h('button', { class: 'chip', 'aria-pressed': String(sel.has(pl.id)), onclick: () => { if (!sel.delete(pl.id)) sel.add(pl.id); drawPlaces(); } }, pl.name)));
+  drawPlaces();
   const dlg = openDialog({
     title: LIST_WORD[kind],
     body: [
@@ -590,8 +598,8 @@ function editItem(kind, x, usedCount) {
       isT ? h('label', { class: 'f' }, 'よみ', yomi) : null,
       isT ? h('label', { class: 'f' }, 'グループ', group) : null,
       isT ? groups : null,
-      isS ? h('label', { class: 'f' }, '場所', place) : null,
-      isS ? h('p', { class: 'sub' }, '来院の記録では、その場所の担当者だけが出ます。「すべての場所」にすると、どの場所でも選べます。場所を変えても、過去の記録はそのままです。') : null,
+      isS ? h('div', { class: 'f' }, h('span', { class: 'sub' }, '出ている場所（いくつでも選べます）'), place) : null,
+      isS ? h('p', { class: 'sub' }, '来院の記録では、選んだ場所でだけ、この担当者が並びます。「すべての場所」にすると、どの場所でも選べます。場所を変えても、過去の記録はそのままです。') : null,
       h('label', { class: 'check' }, off, '使わない（選ぶ画面に出さない。過去の記録と統計には残ります）'),
       usedCount ? h('p', { class: 'sub' }, `記録で ${usedCount}回 使われているので、削除はできません。名前を変えると、過去の記録の表示も変わります。`)
         : h('button', { class: 'btn danger small', style: 'align-self:flex-start', onclick: async () => { await del(kind, x.id); dlg.close(); } }, '削除'),
@@ -600,7 +608,8 @@ function editItem(kind, x, usedCount) {
       const t = name.value.trim();
       if (!t) { toast('名前を入れてください'); return; }
       if ([...db[kind].values()].some(o => o.name === t && o.id !== x.id)) { toast(`「${t}」はすでにあります`); return; }
-      Object.assign(x, { name: t, archived: off.checked }, isT ? { yomi: yomi.value.trim(), group: group.value.trim() } : {}, isS ? { placeId: place.value || null } : {});
+      Object.assign(x, { name: t, archived: off.checked }, isT ? { yomi: yomi.value.trim(), group: group.value.trim() } : {});
+      if (isS) setStaffPlaces(x, [...sel]);
       await put(kind, x); dlg.close();
     } }, '保存')],
     onClose: render,
@@ -619,7 +628,7 @@ function bulkAdd(kind) {
         const [n, y = '', g = ''] = line.split(/[,、，\t]/).map(s => s.trim());
         if (!n || have.has(n)) continue;
         have.add(n);
-        add.push(isT ? { id: uid(), name: n, yomi: y, group: g, archived: false, created: Date.now(), updated: Date.now() } : { id: uid(), name: n, ...(kind === 'staff' ? { placeId: staffPlace || null } : {}), archived: false, created: Date.now(), updated: Date.now() });
+        add.push(isT ? { id: uid(), name: n, yomi: y, group: g, archived: false, created: Date.now(), updated: Date.now() } : { id: uid(), name: n, ...(kind === 'staff' ? { placeIds: staffPlace ? [staffPlace] : [] } : {}), archived: false, created: Date.now(), updated: Date.now() });
       }
       try { await store.putMany({ [kind]: add }); } catch (e) { console.error(e); toast('保存できませんでした'); return; }
       for (const o of add) db[kind].set(o.id, o);
@@ -728,13 +737,13 @@ async function mergeLocalIntoCloud(me) {
   const known = new Set([...local.places, ...remote.places].map(o => o.id));
   const first = [...local.places, ...remote.places].sort((a, b) => a.created - b.created)[0];
   for (const p of local.patients) p.placeId = to('places', known.has(p.placeId) ? p.placeId : first.id);
-  for (const s of local.staff) if (s.placeId) s.placeId = to('places', s.placeId);
+  for (const s of local.staff) { s.placeIds = [...new Set((Array.isArray(s.placeIds) ? s.placeIds : s.placeId ? [s.placeId] : []).map(x => to('places', x)))]; delete s.placeId; }
   for (const v of local.visits) {
     v.symptoms = [...new Set((v.symptoms || []).map(x => to('symptoms', x)))];
     if (v.staffId) v.staffId = to('staff', v.staffId);
     for (const r of v.rows || []) { r.tsuboId = to('tsubo', r.tsuboId); if (r.symptomId) r.symptomId = to('symptoms', r.symptomId); }
   }
-  const usedPlaces = new Set([...local.patients, ...local.staff].map(o => o.placeId));
+  const usedPlaces = new Set([...local.patients.map(p => p.placeId), ...local.staff.flatMap(s => s.placeIds)]);
   const ops = [];
   for (const k of DATA_KINDS) {
     const byId = new Map(remote[k].map(o => [o.id, o]));
