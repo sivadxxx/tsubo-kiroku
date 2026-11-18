@@ -4,7 +4,7 @@ import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 import { createCloud, explain } from './cloud-firebase.js';
 import { firebaseConfig } from './config.js';
 
-const VERSION = '1.7';
+const VERSION = '1.8';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -701,17 +701,52 @@ function editItem(kind, x, usedCount) {
       h('label', { class: 'check' }, off, '使わない（選ぶ画面に出さない。過去の記録と統計には残ります）'),
       usedCount ? h('p', { class: 'sub' }, `記録で ${usedCount}回 使われているので、削除はできません。名前を変えると、過去の記録の表示も変わります。`)
         : h('button', { class: 'btn danger small', style: 'align-self:flex-start', onclick: async () => { await del(kind, x.id); dlg.close(); } }, '削除'),
+      kind === 'symptoms' && db.symptoms.size > 1 ? h('button', { class: 'btn small', style: 'align-self:flex-start', onclick: () => pickMerge(x, usedCount, () => dlg.close()) }, 'ほかの症状にまとめる') : null,
     ],
     footer: [h('button', { class: 'btn', onclick: () => dlg.close() }, 'やめる'), h('button', { class: 'btn primary', onclick: async () => {
       const t = name.value.trim();
       if (!t) { toast('名前を入れてください'); return; }
-      if ([...db[kind].values()].some(o => o.name === t && o.id !== x.id)) { toast(`「${t}」はすでにあります`); return; }
+      const same = [...db[kind].values()].find(o => o.name === t && o.id !== x.id);
+      // 症状は、すでにある名前に変えようとしたら、その症状にまとめるかを聞く
+      if (same && kind === 'symptoms') { if (await confirmDialog(`「${t}」はすでにあります。\n${mergeNote(x, same, usedCount)}`, 'まとめる') && await mergeSymptom(x, same)) dlg.close(); return; }
+      if (same) { toast(`「${t}」はすでにあります`); return; }
       Object.assign(x, { name: t, archived: off.checked }, isT ? { yomi: yomi.value.trim(), group: group.value.trim() } : {});
       if (isS) setStaffPlaces(x, [...sel]);
       await put(kind, x); dlg.close();
     } }, '保存')],
     onClose: render,
   });
+}
+// 症状を1つにまとめる（例：「〜 右」「〜 左」を「〜」に）
+const mergeNote = (from, to, usedCount) => `「${from.name}」を「${to.name}」にまとめます。\n\n` + (usedCount ? `「${from.name}」の記録（${usedCount}回）は「${to.name}」の記録になり、` : '') + `「${from.name}」はリストから消えます。元には戻せません。`;
+function pickMerge(from, usedCount, onDone) {
+  const others = [...db.symptoms.values()].filter(s => s.id !== from.id).sort((a, b) => (a.archived - b.archived) || byOrder(byCreated)(a, b));
+  const sel = h('select', null, others.map(s => h('option', { value: s.id }, s.name + (s.archived ? '（使わない）' : ''))));
+  const dlg = openDialog({
+    title: '症状をまとめる',
+    body: [
+      h('p', { class: 'sub' }, `「${from.name}」を、ほかの症状にまとめます。` + (usedCount ? `「${from.name}」の記録（${usedCount}回）は、まとめる先の症状の記録になります。` : '') + `「${from.name}」はリストから消えます。`),
+      h('label', { class: 'f' }, 'まとめる先', sel),
+    ],
+    footer: [h('button', { class: 'btn', onclick: () => dlg.close() }, 'やめる'), h('button', { class: 'btn primary', onclick: async () => {
+      const to = db.symptoms.get(sel.value);
+      if (!to || !await confirmDialog(mergeNote(from, to, usedCount), 'まとめる')) return;
+      if (await mergeSymptom(from, to)) { dlg.close(); onDone(); }
+    } }, 'まとめる')],
+  });
+}
+// from を選んだ来院の記録を to に付け替えてから、from をリストから消す
+async function mergeSymptom(from, to) {
+  const now = Date.now(), next = [];
+  for (const v of db.visits.values()) {
+    if (!v.symptoms.includes(from.id) && !v.rows.some(r => r.symptomId === from.id)) continue;
+    next.push({ ...v, symptoms: [...new Set(v.symptoms.map(s => (s === from.id ? to.id : s)))], rows: v.rows.map(r => (r.symptomId === from.id ? { ...r, symptomId: to.id } : r)), updated: now });
+  }
+  try { await store.putMany({ visits: next }); } catch (e) { console.error(e); toast('まとめられませんでした。もう一度お試しください'); return false; }
+  for (const v of next) db.visits.set(v.id, v);
+  await del('symptoms', from.id);
+  toast(`「${from.name}」を「${to.name}」にまとめました`);
+  return true;
 }
 function bulkAdd(kind) {
   const isT = kind === 'tsubo';

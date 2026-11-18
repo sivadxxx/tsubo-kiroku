@@ -1,5 +1,5 @@
 // ツボ記録：オフライン用のキャッシュ（src/build.py が生成）
-const CACHE = 'tsubo-kiroku-ccec3a40d7e3';
+const CACHE = 'tsubo-kiroku-6eda3241105e';
 const ASSETS = ["./", "index.html", "app.js", "store.js", "stats.js", "cloud-firebase.js", "config.js", "manifest.webmanifest", "icons/icon-180.png", "icons/icon-192.png", "icons/icon-512.png"];
 const SDK = ["https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js", "https://www.gstatic.com/firebasejs/12.15.0/firebase-auth.js", "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js"];       // 同期（Firebase）の部品。電波がなくても開けるように取っておく
 self.addEventListener('install', e => {
