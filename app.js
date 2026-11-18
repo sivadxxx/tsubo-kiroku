@@ -4,7 +4,7 @@ import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 import { createCloud, explain } from './cloud-firebase.js';
 import { firebaseConfig } from './config.js';
 
-const VERSION = '1.9';
+const VERSION = '1.10';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -548,16 +548,20 @@ function pickTsubo(v) {
 
 /* ---------- 統計 ---------- */
 const stats = { mode: 'symptom', symptomId: undefined, tsuboId: undefined, period: 'all', sort: 'good', place: 'all', staff: 'all', rank: 'all', back: 0 };
-// ツボランキングの期間。今日を終わりにした 1日・1週間・1か月・1年で、back は、その長さでいくつ前までさかのぼるか
-const RANK_PERIODS = [['day', '1日'], ['week', '1週間'], ['month', '1か月'], ['year', '1年'], ['all', '全期間']];
+// ツボランキングの期間。こよみの区切り（その日・月曜からの1週間・その月・その年）で、back は、いくつ前までさかのぼるか
+const RANK_PERIODS = [['day', '今日'], ['week', '今週'], ['month', '今月'], ['year', '今年'], ['all', '全期間']];
 function rankRange(kind, back) {
   if (kind === 'all') return null;
-  const day = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
-  // n か月あとの同じ日（その月にない日は、月の終わりに寄せる）
-  const month = (d, n) => { const last = new Date(d.getFullYear(), d.getMonth() + n + 1, 0); return new Date(last.getFullYear(), last.getMonth(), Math.min(d.getDate(), last.getDate())); };
-  const days = { day: 1, week: 7 }[kind], months = { month: 1, year: 12 }[kind];
-  const end = days ? day(new Date(), -days * back) : month(new Date(), -months * back);
-  return { from: ymd(days ? day(end, 1 - days) : day(month(end, -months), 1)), to: ymd(end) };
+  const now = new Date(), y = now.getFullYear(), m = now.getMonth(), d = now.getDate();
+  const mon = d - (now.getDay() + 6) % 7;      // 今週の月曜
+  const [from, to] = {
+    day: [new Date(y, m, d - back), new Date(y, m, d - back)],
+    week: [new Date(y, m, mon - 7 * back), new Date(y, m, mon - 7 * back + 6)],
+    month: [new Date(y, m - back, 1), new Date(y, m - back + 1, 0)],
+    year: [new Date(y - back, 0, 1), new Date(y - back, 11, 31)],
+  }[kind];
+  const label = kind === 'day' ? fmtDate(ymd(from)) : kind === 'week' ? `${fmtDate(ymd(from))}〜${fmtDate(ymd(to))}` : `${from.getFullYear()}年` + (kind === 'month' ? `${from.getMonth() + 1}月` : '');
+  return { from: ymd(from), to: ymd(to), label };
 }
 // 集計の1行：順位・名前・右の数字・効果の内訳の棒（棒の長さは使った回数に合わせ、いちばん多いものが端まで）
 const statRow = (rank, name, val, a, maxUsed, sub) => h('div', { class: 'stat' },
@@ -595,13 +599,12 @@ function viewStats() {
   if (isRank) {
     // すべてのツボを、使った回数の多い順に。同じ回数のツボは同じ順位
     const list = sortAgg(aggregate(rows, r => r.tsuboId), 'used');
-    const md = s => { const [y, m, d] = s.split('-').map(Number); return (y === new Date().getFullYear() ? '' : y + '/') + m + '/' + d; };
     return [...head,
       h('div', { class: 'card' },
         h('div', { class: 'seg', role: 'group', 'aria-label': '期間' }, RANK_PERIODS.map(([k, l]) => h('button', { class: 'btn', style: 'padding:8px 2px', 'aria-pressed': String(stats.rank === k), onclick: () => { stats.rank = k; stats.back = 0; render(); } }, l))),
         range ? h('div', { class: 'row' },
           h('button', { class: 'btn icon', 'aria-label': '前の期間', onclick: () => set('back', stats.back + 1) }, '‹'),
-          h('div', { class: 'grow', style: 'text-align:center;font-variant-numeric:tabular-nums' }, stats.rank === 'day' ? fmtDate(range.to) + (stats.back ? '' : '・今日') : `${md(range.from)} 〜 ${md(range.to)}`),
+          h('div', { class: 'grow', style: 'text-align:center;font-variant-numeric:tabular-nums' }, range.label),
           h('button', { class: 'btn icon', 'aria-label': '次の期間', disabled: !stats.back, onclick: () => set('back', stats.back - 1) }, '›')) : null,
         list.length ? [statLegend(), h('div', null, list.map((a, i) => statRow(list.findIndex(x => x.used === a.used) + 1, tsuboName(a.key), [h('b', null, a.used), '回'], a, list[0].used, `${a.patients}人`)))]
           : h('p', { class: 'empty' }, stats.place !== 'all' || stats.staff !== 'all' ? 'この条件に当てはまる記録がありません。' : range ? 'この期間の記録がありません。' : 'まだ記録がありません。施術を記録すると、ここにランキングが出ます。')),
