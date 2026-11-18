@@ -4,7 +4,7 @@ import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 import { createCloud, explain } from './cloud-firebase.js';
 import { firebaseConfig } from './config.js';
 
-const VERSION = '1.8';
+const VERSION = '1.9';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -547,19 +547,43 @@ function pickTsubo(v) {
 }
 
 /* ---------- 統計 ---------- */
-const stats = { mode: 'symptom', symptomId: undefined, tsuboId: undefined, period: 'all', sort: 'good', place: 'all', staff: 'all' };
+const stats = { mode: 'symptom', symptomId: undefined, tsuboId: undefined, period: 'all', sort: 'good', place: 'all', staff: 'all', rank: 'all', back: 0 };
+// ツボランキングの期間。今日を終わりにした 1日・1週間・1か月・1年で、back は、その長さでいくつ前までさかのぼるか
+const RANK_PERIODS = [['day', '1日'], ['week', '1週間'], ['month', '1か月'], ['year', '1年'], ['all', '全期間']];
+function rankRange(kind, back) {
+  if (kind === 'all') return null;
+  const day = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+  // n か月あとの同じ日（その月にない日は、月の終わりに寄せる）
+  const month = (d, n) => { const last = new Date(d.getFullYear(), d.getMonth() + n + 1, 0); return new Date(last.getFullYear(), last.getMonth(), Math.min(d.getDate(), last.getDate())); };
+  const days = { day: 1, week: 7 }[kind], months = { month: 1, year: 12 }[kind];
+  const end = days ? day(new Date(), -days * back) : month(new Date(), -months * back);
+  return { from: ymd(days ? day(end, 1 - days) : day(month(end, -months), 1)), to: ymd(end) };
+}
+// 集計の1行：順位・名前・右の数字・効果の内訳の棒（棒の長さは使った回数に合わせ、いちばん多いものが端まで）
+const statRow = (rank, name, val, a, maxUsed, sub) => h('div', { class: 'stat' },
+  h('span', { class: 'rank' }, rank),
+  h('div', { class: 'head' }, h('span', { class: 'nm' }, name), h('span', { class: 'val' }, val)),
+  h('div', null,
+    h('div', { class: 'bar', style: `width:${Math.max(6, a.used / maxUsed * 100)}%`, role: 'img', 'aria-label': EFFECTS.map(e => `${e.mark}${a.counts[e.v]}回`).join(' ') + ` 未入力${a.used - a.evaluated}回` },
+      EFFECTS.map(e => a.counts[e.v] ? h('i', { class: 'e' + e.v, style: `flex:${a.counts[e.v]}`, title: `${e.mark} ${a.counts[e.v]}回` }) : null),
+      a.used - a.evaluated ? h('i', { style: `flex:${a.used - a.evaluated}`, title: `未入力 ${a.used - a.evaluated}回` }) : null),
+    h('div', { class: 'sub' }, sub + EFFECTS.filter(e => a.counts[e.v]).map(e => `　${e.mark}${a.counts[e.v]}`).join(''))));
+const statLegend = () => h('div', { class: 'legend' }, EFFECTS.map(e => h('span', { class: 'key' }, h('i', { class: 'e' + e.v }), `${e.mark} ${e.label}`)), h('span', { class: 'key' }, h('i', { class: 'en' }), '効果を未入力'));
 function viewStats() {
-  const from = stats.period === 'all' ? null : (() => { const d = new Date(); d.setMonth(d.getMonth() - Number(stats.period)); return ymd(d); })();
+  const isRank = stats.mode === 'rank';
+  const range = isRank ? rankRange(stats.rank, stats.back) : null;
+  const from = isRank ? range && range.from : stats.period === 'all' ? null : (() => { const d = new Date(); d.setMonth(d.getMonth() - Number(stats.period)); return ymd(d); })();
+  const to = range && range.to;
   if (!db.places.has(stats.place)) stats.place = 'all';
   const inPlace = v => { const p = db.patients.get(v.patientId); return stats.place === 'all' || (p && placeOf(p) === stats.place); };
   const staffOpts = [...db.staff.values()].filter(s => inStaffPlace(s, stats.place === 'all' ? null : stats.place)).sort(byOrder(byCreated));      // 場所でしぼっているときは、その場所の担当者だけ
   if (!staffOpts.some(s => s.id === stats.staff)) stats.staff = 'all';
-  const visits = [...db.visits.values()].filter(v => (!from || v.date >= from) && inPlace(v) && (stats.staff === 'all' || v.staffId === stats.staff));
+  const visits = [...db.visits.values()].filter(v => (!from || v.date >= from) && (!to || v.date <= to) && inPlace(v) && (stats.staff === 'all' || v.staffId === stats.staff));
   const rows = flatten(visits);
   const set = (k, val) => { stats[k] = val; render(); };
   const head = [
     topbar('統計'),
-    h('div', { class: 'seg' }, [['symptom', '症状ごとの効いたツボ'], ['tsubo', 'ツボごとの効いた症状']].map(([m, l]) => h('button', { class: 'btn', 'aria-pressed': String(stats.mode === m), onclick: () => set('mode', m) }, l))),
+    h('div', { class: 'seg' }, [['symptom', '症状ごとの', '効いたツボ'], ['tsubo', 'ツボごとの', '効いた症状'], ['rank', 'ツボ', 'ランキング']].map(([m, a, b]) => h('button', { class: 'btn', style: 'word-break:keep-all;overflow-wrap:anywhere', 'aria-pressed': String(stats.mode === m), onclick: () => set('mode', m) }, h('span', null, a, h('wbr'), b)))),
     h('div', { class: 'nums' },
       h('div', null, h('b', null, new Set(visits.map(v => v.patientId)).size), h('span', null, '患者')),
       h('div', null, h('b', null, visits.length), h('span', null, '来院')),
@@ -568,6 +592,22 @@ function viewStats() {
       db.places.size > 1 ? h('div', { class: 'grow' }, h('select', { 'aria-label': '場所', onchange: e => set('place', e.target.value) }, [['all', 'すべての場所'], ...places().map(pl => [pl.id, pl.name])].map(([val, l]) => h('option', { value: val, selected: stats.place === val }, l)))) : null,
       db.staff.size > 1 ? h('div', { class: 'grow' }, h('select', { 'aria-label': '担当者', onchange: e => set('staff', e.target.value) }, [['all', 'すべての担当者'], ...staffOpts.map(s => [s.id, s.name])].map(([val, l]) => h('option', { value: val, selected: stats.staff === val }, l)))) : null) : null,
   ];
+  if (isRank) {
+    // すべてのツボを、使った回数の多い順に。同じ回数のツボは同じ順位
+    const list = sortAgg(aggregate(rows, r => r.tsuboId), 'used');
+    const md = s => { const [y, m, d] = s.split('-').map(Number); return (y === new Date().getFullYear() ? '' : y + '/') + m + '/' + d; };
+    return [...head,
+      h('div', { class: 'card' },
+        h('div', { class: 'seg', role: 'group', 'aria-label': '期間' }, RANK_PERIODS.map(([k, l]) => h('button', { class: 'btn', style: 'padding:8px 2px', 'aria-pressed': String(stats.rank === k), onclick: () => { stats.rank = k; stats.back = 0; render(); } }, l))),
+        range ? h('div', { class: 'row' },
+          h('button', { class: 'btn icon', 'aria-label': '前の期間', onclick: () => set('back', stats.back + 1) }, '‹'),
+          h('div', { class: 'grow', style: 'text-align:center;font-variant-numeric:tabular-nums' }, stats.rank === 'day' ? fmtDate(range.to) + (stats.back ? '' : '・今日') : `${md(range.from)} 〜 ${md(range.to)}`),
+          h('button', { class: 'btn icon', 'aria-label': '次の期間', disabled: !stats.back, onclick: () => set('back', stats.back - 1) }, '›')) : null,
+        list.length ? [statLegend(), h('div', null, list.map((a, i) => statRow(list.findIndex(x => x.used === a.used) + 1, tsuboName(a.key), [h('b', null, a.used), '回'], a, list[0].used, `${a.patients}人`)))]
+          : h('p', { class: 'empty' }, stats.place !== 'all' || stats.staff !== 'all' ? 'この条件に当てはまる記録がありません。' : range ? 'この期間の記録がありません。' : 'まだ記録がありません。施術を記録すると、ここにランキングが出ます。')),
+      list.length ? h('p', { class: 'sub' }, `使ったツボは ${list.length}種類、のべ ${rows.length}回です。回数は、記録の1行を1回と数えます（同じ日に左と右を別々に記録すると2回）。`) : null,
+    ];
+  }
   const period = h('select', { 'aria-label': '期間', onchange: e => set('period', e.target.value) }, [['all', '全期間'], ['3', '直近3か月'], ['12', '直近1年']].map(([val, l]) => h('option', { value: val, selected: stats.period === val }, l)));
   if (!rows.length) return [...head, period, h('p', { class: 'empty' }, stats.place !== 'all' || stats.staff !== 'all' ? 'この条件に当てはまる記録がまだありません。' : 'この期間の記録がまだありません。施術を記録すると、ここに集計が出ます。')];
 
@@ -588,17 +628,8 @@ function viewStats() {
     h('div', { class: 'card' },
       h('label', { class: 'f' }, bySym ? '症状' : 'ツボ', picker),
       h('div', { class: 'row' }, h('div', { class: 'grow' }, period), h('div', { class: 'grow' }, sort)),
-      h('div', { class: 'legend' }, EFFECTS.map(e => h('span', { class: 'key' }, h('i', { class: 'e' + e.v }), `${e.mark} ${e.label}`)), h('span', { class: 'key' }, h('i', { class: 'en' }), '効果を未入力')),
-      h('div', null, list.map((a, i) => h('div', { class: 'stat' },
-        h('span', { class: 'rank' }, i + 1),
-        h('div', { class: 'head' },
-          h('span', { class: 'nm' }, otherName(a.key)),
-          h('span', { class: 'val' }, a.evaluated ? ['効いた ', h('b', null, `${a.good}/${a.evaluated}`), `回（${Math.round(a.rate * 100)}%）`] : h('span', { class: 'sub' }, '効果を未入力'))),
-        h('div', null,
-          h('div', { class: 'bar', style: `width:${Math.max(6, a.used / maxUsed * 100)}%`, role: 'img', 'aria-label': EFFECTS.map(e => `${e.mark}${a.counts[e.v]}回`).join(' ') + ` 未入力${a.used - a.evaluated}回` },
-            EFFECTS.map(e => a.counts[e.v] ? h('i', { class: 'e' + e.v, style: `flex:${a.counts[e.v]}`, title: `${e.mark} ${a.counts[e.v]}回` }) : null),
-            a.used - a.evaluated ? h('i', { style: `flex:${a.used - a.evaluated}`, title: `未入力 ${a.used - a.evaluated}回` }) : null),
-          h('div', { class: 'sub' }, `使った ${a.used}回・${a.patients}人` + EFFECTS.filter(e => a.counts[e.v]).map(e => `　${e.mark}${a.counts[e.v]}`).join(''))))))),
+      statLegend(),
+      h('div', null, list.map((a, i) => statRow(i + 1, otherName(a.key), a.evaluated ? ['効いた ', h('b', null, `${a.good}/${a.evaluated}`), `回（${Math.round(a.rate * 100)}%）`] : h('span', { class: 'sub' }, '効果を未入力'), a, maxUsed, `使った ${a.used}回・${a.patients}人`)))),
     h('p', { class: 'sub' }, `「効いた」は ◎ と ○ の合計です。割合は、効果を入れた回数に対するものです。この${bySym ? '症状' : 'ツボ'}の記録は、のべ ${total}回です。回数が少ないうちは、割合は目安としてご覧ください。`),
   ];
 }
