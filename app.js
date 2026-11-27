@@ -6,7 +6,7 @@ import { firebaseConfig } from './config.js';
 import * as ms from './monshin.js';
 import { makePdf } from './pdf.js';
 
-const VERSION = '1.13';
+const VERSION = '1.14';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -519,9 +519,11 @@ function viewVisit(id) {
 const urlParams = new URLSearchParams(location.search);
 const isMock = ['localhost', '127.0.0.1'].includes(location.hostname) && urlParams.has('mock');      // 動作確認用（にせの AI・にせのマイク）
 // iPad のホーム画面アプリは、左上にウインドウのボタンが重なる（よける幅を教えてくれる仕組みが無い）。自分で見分けて、上のバーを右へよける
-const isIpadApp = (navigator.standalone === true || matchMedia('(display-mode: standalone)').matches)
-  && (/iPad/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
-document.documentElement.classList.toggle('ipad-win', isIpadApp || (isMock && urlParams.has('ipadwin')));   // ?mock&ipadwin は動作確認用
+// 見分け方：ホーム画面から開いている・指でさわる端末・iPhone ではない（iPad は自分を Mac と名のることがあるので、名前では決めない）
+const isIpadApp = ((navigator.standalone === true || matchMedia('(display-mode: standalone)').matches)
+  && navigator.maxTouchPoints > 1 && !/iPhone|iPod|Android/.test(navigator.userAgent))
+  || (isMock && urlParams.has('ipadwin'));      // ?mock&ipadwin は動作確認用
+document.documentElement.classList.toggle('ipad-win', isIpadApp);
 const talkJobs = new Map();      // 来院の id → 文字起こし・まとめの途中（{ step: 'tr', i, n } か { step: 'sum' }）
 const talkErrs = new Map();      // 来院の id → うまくいかなかった理由（AiError）
 const talkNote = new Map();      // 来院の id → 録音を始められなかった・途中で止まったときの知らせ
@@ -1160,7 +1162,7 @@ function viewSettings() {
       h('p', null, 'ツボ1つを1行にした一覧です。Excel や Numbers で、自由に集計できます。'),
       h('button', { class: 'btn', disabled: !db.visits.size, onclick: () => saveFile(`ツボ記録-${stamp()}.csv`, toCsv(), 'text/csv') }, 'CSV を書き出す')),
     aiCard(),
-    h('p', { class: 'sub' }, `患者 ${db.patients.size}人・来院 ${db.visits.size}回・ツボ ${db.tsubo.size}個・症状 ${db.symptoms.size}個　／　ツボ記録 ${VERSION}`),
+    h('p', { class: 'sub' }, `患者 ${db.patients.size}人・来院 ${db.visits.size}回・ツボ ${db.tsubo.size}個・症状 ${db.symptoms.size}個　／　ツボ記録 ${VERSION}${isIpadApp ? '（iPad 用の表示）' : ''}`),
   ];
 }
 
@@ -1382,7 +1384,18 @@ async function main() {
   window.addEventListener('beforeunload', e => { if (ms.isRecording()) { e.preventDefault(); e.returnValue = ''; } });      // 録音中に閉じかけたら、たずねる
   $('#recbar').addEventListener('click', () => { if (ms.isRecording()) go('#/v/' + ms.rec.visitId); });
   document.addEventListener('focusout', () => setTimeout(() => { if (needRender && !busy()) render(); }, 150));
-  if ('serviceWorker' in navigator && !isLocalhost) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && !isLocalhost) {
+    // 新しい版は、開いたあと裏で入る。まだ何もさわっていなければ、その場で読みなおして新しい版に切り替える（さわったあとは、作業を止めないよう知らせるだけ）
+    const had = !!navigator.serviceWorker.controller;
+    let touched = false;
+    for (const ev of ['pointerdown', 'keydown']) window.addEventListener(ev, () => { touched = true; }, { capture: true, passive: true });
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!had) return;
+      if (!touched && !ms.isRecording() && !busy()) location.reload();
+      else toast('新しい版が入りました。閉じて開き直すと切り替わります');
+    });
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
 
   if (metaGet('sync')) {
     // 前回ログインしていた：クラウドの記録を出す。端末の中の記録として使い始めてしまわないよう、準備できるまで待つ
