@@ -6,7 +6,7 @@ import { firebaseConfig } from './config.js';
 import * as ms from './monshin.js';
 import { makePdf } from './pdf.js';
 
-const VERSION = '1.11';
+const VERSION = '1.12';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -370,9 +370,13 @@ function viewPatient(id) {
     }
     go('#/v/' + v.id);
   };
+  if (pv.id !== id) Object.assign(pv, { id, sort: 'good', sym: null, all: false });      // ほかの患者を開いたら、初めの状態に戻す
   return [
-    topbar(patientName(p), '#/', p.memo || null, h('button', { class: 'btn small', onclick: () => editPatient(p) }, '編集')),
+    topbar(patientName(p), '#/', null, h('button', { class: 'btn small', onclick: () => editPatient(p) }, '編集')),
     h('button', { class: 'btn primary big', onclick: start }, vs.some(x => x.date === today()) ? '今日の記録を開く' : '＋ 今日の施術を記録'),
+    patientInfoCard(p, vs),
+    patientTalkCard(vs),
+    patientTsuboCard(vs),
     h('h2', null, `これまでの記録（${vs.length}回）`),
     vs.length ? h('ul', { class: 'list' }, vs.map((v, i) => h('li', null, h('button', { class: 'item', onclick: () => go('#/v/' + v.id) },
       h('span', { class: 'ttl' }, fmtDate(v.date), h('small', null, `${i + 1}回目` + (db.staff.has(v.staffId) ? `・担当 ${staffName(v.staffId)}` : '')), v.symptoms.map(s => h('span', { class: 'tag' }, symptomName(s))),
@@ -381,6 +385,61 @@ function viewPatient(id) {
       v.memo ? h('span', { class: 'sub' }, v.memo) : null))).reverse())
       : h('p', { class: 'empty' }, 'まだ記録がありません。'),
   ];
+}
+// 患者の画面の「使ったツボ」の並べ方・症状のしぼり込み・すべて見るか（ほかの患者を開くと初めに戻す）
+const pv = { id: null, sort: 'good', sym: null, all: false };
+const pvTalkOpen = new Set();      // 患者の画面で開いている、前の問診のまとめ（来院の id）。描き直しても閉じないように
+// 項目名（小さく薄い字）と中身を縦に並べる
+const infoItem = (label, ...body) => h('div', null, h('div', { class: 'sub' }, label), h('div', null, ...body));
+function patientInfoCard(p, vs) {
+  const first = vs[0], last = vs[vs.length - 1];
+  // 名前があれば名前で、なければ番号で（patientName と同じ見分け方。場所の管理のしかたを変えたあとの患者もそのまま出す）
+  const who = p.name ? [infoItem('名前', p.name), p.yomi ? infoItem('よみ', p.yomi) : null]
+    : [infoItem('No', p.no || ''), p.label ? infoItem('呼び名', p.label) : null];
+  return h('div', { class: 'card' },
+    h('h2', null, '患者さんの情報'),
+    who,
+    db.places.size > 1 ? infoItem('場所', db.places.get(placeOf(p)).name) : null,
+    infoItem('来院', vs.length ? [`初回 ${fmtDate(first.date)}`, `最終 ${fmtDate(last.date)}`, `${vs.length}回`].map((s, i) => [i ? ' ・ ' : '', h('span', { style: 'white-space:nowrap' }, s)])      // 「4」と「回」のあいだなどで折り返さない
+      : h('span', { class: 'sub' }, 'まだ来院の記録がありません')),
+    infoItem('メモ', p.memo ? h('div', { class: 'pre' }, p.memo) : h('span', { class: 'sub' }, 'メモはまだありません（「編集」から書けます）')));
+}
+// 問診のまとめ：いちばん新しいものは全文を開いて、それより前のものは閉じて並べる
+function patientTalkCard(vs) {
+  const list = vs.map((v, i) => ({ v, n: i + 1 })).filter(x => x.v.talk && (x.v.talk.summary || '').trim()).reverse();
+  const title = x => `${fmtDate(x.v.date)}・${x.n}回目`;
+  const openBtn = x => h('button', { class: 'btn', onclick: () => go('#/v/' + x.v.id) }, 'この日の記録をひらく');
+  const body = x => h('div', { class: 'pre' }, x.v.talk.summary);
+  if (!list.length) return h('div', { class: 'card' }, h('h2', null, '問診のまとめ'), h('p', { class: 'sub' }, '問診を録音すると、ここにまとめが出ます。'));
+  const [top, ...older] = list;
+  return h('div', { class: 'card' },
+    h('h2', null, '問診のまとめ'),
+    h('div', { class: 'row wrap', style: 'justify-content:space-between' }, h('b', null, title(top)), openBtn(top)),
+    body(top),
+    older.map(x => h('details', { class: 'talk-all', open: pvTalkOpen.has(x.v.id), ontoggle: e => { if (e.target.open) pvTalkOpen.add(x.v.id); else pvTalkOpen.delete(x.v.id); } },
+      h('summary', null, title(x)), body(x), openBtn(x))));
+}
+// 使ったツボ：この患者の来院だけで集計する。行の書き方は、統計の「症状ごとの効いたツボ」とそろえる
+function patientTsuboCard(vs) {
+  const rows = flatten(vs);
+  const syms = [...new Set(rows.map(r => r.symptomId).filter(s => s != null))];
+  if (syms.length < 2 || !syms.includes(pv.sym)) pv.sym = null;
+  const list = sortAgg(aggregate(pv.sym == null ? rows : rows.filter(r => r.symptomId === pv.sym), r => r.tsuboId), pv.sort);
+  const TOP = 5;
+  const shown = pv.all ? list : list.slice(0, TOP);
+  const maxUsed = Math.max(1, ...list.map(a => a.used));
+  const set = (k, val) => { pv[k] = val; render(); };
+  return h('div', { class: 'card' },
+    h('h2', null, '使ったツボ'),
+    !list.length ? h('p', { class: 'sub' }, 'ツボを記録すると、ここに集計が出ます。') : [
+      h('div', { class: 'seg', role: 'group', 'aria-label': '並べ方' }, [['good', '効いた順'], ['used', '使った順']].map(([k, l]) => h('button', { class: 'btn', 'aria-pressed': String(pv.sort === k), onclick: () => set('sort', k) }, l))),
+      syms.length >= 2 ? h('div', { class: 'chips', role: 'group', 'aria-label': '症状でしぼる' },
+        h('button', { class: 'chip', 'aria-pressed': String(pv.sym == null), onclick: () => set('sym', null) }, 'すべて'),
+        syms.map(s => h('button', { class: 'chip', 'aria-pressed': String(pv.sym === s), onclick: () => set('sym', s) }, symptomName(s)))) : null,
+      statLegend(),
+      h('div', null, shown.map((a, i) => statRow(i + 1, tsuboName(a.key), a.evaluated ? ['効いた ', h('b', null, `${a.good}/${a.evaluated}`), `回（${Math.round(a.rate * 100)}%）`] : h('span', { class: 'sub' }, '効果を未入力'), a, maxUsed, `使った ${a.used}回`))),
+      list.length > TOP ? h('button', { class: 'btn', onclick: () => set('all', !pv.all) }, pv.all ? `上位${TOP}つだけにする` : `すべて見る（${list.length}個）`) : null,
+    ]);
 }
 
 /* ---------- 来院の記録 ---------- */
