@@ -6,7 +6,7 @@ import { firebaseConfig } from './config.js';
 import * as ms from './monshin.js';
 import { makePdf } from './pdf.js';
 
-const VERSION = '1.14';
+const VERSION = '1.15';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -536,6 +536,17 @@ const aiPrompt = () => metaGet('aiPrompt') || ms.DEFAULT_PROMPT;
 const aiTerms = () => ({ symptoms: activeSymptoms().sort(byOrder(byCreated)).map(s => s.name), tsubo: activeTsubo().sort(tsuboOrder).map(t => t.name) });
 const mmss = t => { const s = Math.floor(t / 1000); return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`; };
 const hhmm = t => { const d = new Date(t); return `${d.getHours()}:${pad(d.getMinutes())}`; };
+// 録音が止まっていた長さ：1分未満は「約◯秒」、それより長いと「約◯分◯秒」（0秒は書かない）
+const gapLen = sec => { const m = Math.floor(sec / 60), s = sec % 60; return '約' + (m ? `${m}分` + (s ? `${s}秒` : '') : `${s}秒`); };
+// 文字起こしに入れる、録音が止まっていた印（1つのあいだに1行）。まとめのいちばん上の合計は、全文のこの印から数える
+const gapMark = g => { const d = new Date(g.at); return `（${d.getHours()}時${d.getMinutes()}分ごろ、${gapLen(g.sec)} 録音が止まっていました）`; };
+const GAP_MARK = /（\d+時\d+分ごろ、約(?:(\d+)分)?(?:(\d+)秒)? 録音が止まっていました）/g;
+const GAP_LINE = /^※ 録音が止まっていた時間があります（合計 約(?:(\d+)分)?(?:(\d+)秒)?）。その間の話は入っていません。\n*/;
+const gapSecOf = text => [...String(text || '').matchAll(GAP_MARK)].reduce((n, m) => n + (Number(m[1]) || 0) * 60 + (Number(m[2]) || 0), 0);
+const stripGapLine = text => String(text || '').replace(GAP_LINE, '');
+const lineSec = text => { const m = String(text || '').match(GAP_LINE); return m ? (Number(m[1]) || 0) * 60 + (Number(m[2]) || 0) : 0; };
+// まとめのいちばん上に、録音が止まっていた合計の1行を置く（すでにあれば置きかえる。AI には頼まない）
+const withGapLine = (summary, sec) => { const body = stripGapLine(summary); return sec > 0 ? `※ 録音が止まっていた時間があります（合計 ${gapLen(sec)}）。その間の話は入っていません。\n\n${body}` : body; };
 const longDate = s => { const [y, m, d] = s.split('-').map(Number); return `${y}年${m}月${d}日（${'日月火水木金土'[new Date(y, m - 1, d).getDay()]}）`; };
 function refresh() { remoteChanged(); updateRecUi(); }
 // 文字の量に合わせて、入力欄の高さを広げる
@@ -550,6 +561,7 @@ async function dropClips(visitId) {
 // 録音の状態が変わった（区切りを保存した・途中で止まった など）
 function recChanged(e) {
   if (e.error === 'save') toast('録音を保存できませんでした。端末の空きを確かめてください');
+  if (e.gap) toast(`隠していた ${gapLen(e.gap.sec)} は、録音が止まっていました`);
   if (e.stopped) {
     const t = e.stopped.why === 'ended' ? 'マイクが止まったため、録音を終えました。そこまでの分は残してあります。' : '録音が途中で止まりました。そこまでの分は残してあります。';
     talkNote.set(e.stopped.visitId, t); toast(t);
@@ -604,7 +616,9 @@ async function processTalk(id) {
       // 文字にできた分は録音といっしょに覚えておき、やり直すときに二重に払わない
       if (typeof c.text !== 'string') { c.text = await ms.transcribe(c.blob, { key, mime: c.mime, terms: aiTerms() }); await ms.putClip(c); }
     }
-    const added = clips.map(c => c.text).filter(t => t.trim()).join('\n');
+    // 録音が止まっていたあいだは、その1本の文の前に印の行を入れる
+    const heard = clips.some(c => c.text.trim());
+    const added = !heard ? '' : clips.map(c => [...(c.gaps || []).map(gapMark), c.text].filter(t => t.trim()).join('\n')).filter(Boolean).join('\n');
     let v = db.visits.get(id);
     if (!v) return;                    // その来院の記録が消された
     const old = v.talk || null;
@@ -616,9 +630,11 @@ async function processTalk(id) {
     const sep = `\n\n――― 続きの録音（${hhmm(clips[0].created)}）―――\n\n`;
     const transcript = old && old.transcript ? old.transcript + sep + added : added;
     // 全文を消してあるときは、前のまとめを手がかりに足して作る
-    const input = old && !old.transcript && old.summary ? `（前の録音のまとめ。全文は消してあります）\n${old.summary}${sep}${added}` : transcript;
+    const input = old && !old.transcript && old.summary ? `（前の録音のまとめ。全文は消してあります）\n${stripGapLine(old.summary)}${sep}${added}` : transcript;
+    // 止まっていた合計は全文の印から数える（全文を消してあるときは、前のまとめの1行の分も足す）
+    const gapSec = gapSecOf(transcript) + (old && !old.transcript ? lineSec(old.summary) : 0);
     talkJobs.set(id, { step: 'sum' }); refresh();
-    const summary = await ms.summarize(input, { key, model: aiModel(), prompt: aiPrompt(), terms: aiTerms() });
+    const summary = withGapLine(await ms.summarize(input, { key, model: aiModel(), prompt: aiPrompt(), terms: aiTerms() }), gapSec);
     v = db.visits.get(id);
     if (!v) return;
     v.talk = { summary, transcript, at: Date.now() };
@@ -636,7 +652,7 @@ async function resummarize(id) {
   if (!await confirmDialog('文字起こしの全文から、まとめを作り直します。手で直した内容は消えます。', '作り直す')) return;
   talkJobs.set(id, { step: 'sum' }); refresh();
   try {
-    const summary = await ms.summarize(v.talk.transcript, { key: aiKey(), model: aiModel(), prompt: aiPrompt(), terms: aiTerms() });
+    const summary = withGapLine(await ms.summarize(v.talk.transcript, { key: aiKey(), model: aiModel(), prompt: aiPrompt(), terms: aiTerms() }), gapSecOf(v.talk.transcript));
     const cur = db.visits.get(id);
     if (cur && cur.talk) { cur.talk = { ...cur.talk, summary, at: Date.now() }; await put('visits', cur); toast('まとめなおしました'); }
   } catch (e) { console.error(`問診の録音：${e.code || ''}`); toast(ms.explainAi(e)); }
@@ -660,8 +676,11 @@ function talkCard(v, p, n) {
   if (here) out.push(
     h('div', { class: 'rec-now' }, h('span', { class: 'rec-dot', 'aria-hidden': 'true' }), '録音中', h('span', { 'data-rec-time': '' }, mmss(ms.elapsed()))),
     h('button', { class: 'btn primary big', onclick: () => stopTalk(v.id) }, '■ 止めてまとめる'),
+    ms.rec.stuck ? h('p', { style: 'color:var(--danger)' }, 'マイクが止まっています。録音を止めて、もう一度始めてください。') : null,
+    ms.rec.gaps.length ? h('p', { style: 'color:var(--danger)' }, `画面から隠していたあいだ、録音が止まっていました（合計 ${gapLen(ms.rec.gaps.reduce((n, g) => n + g.sec, 0))}）。その間の話は入っていません。`) : null,
     h('button', { class: 'btn small danger', style: 'align-self:flex-start', onclick: cancelTalk }, '取り消す'),
-    h('p', { class: 'sub' }, '録音中も、ツボ選びなどの入力や、ほかの画面への移動ができます。'));
+    h('p', { class: 'sub' }, '録音中も、ツボ選びなどの入力や、ほかの画面への移動ができます。'),
+    h('p', { class: 'sub' }, 'ツボ記録を画面から隠すと、録音が止まります。細くしてでも、出したままにしてください。'));
   else if (job) out.push(h('p', { class: 'talk-busy' }, job.step === 'tr' ? `文字にしています…（${job.i}/${job.n}）` : 'まとめています…'), h('p', { class: 'sub' }, 'このあいだも、ほかの入力ができます。'));
   else if (pend.n) out.push(
     h('p', null, `まだ文字にしていない録音があります（${pend.n}本・${pend.ms < 60000 ? '1分未満' : `約${Math.round(pend.ms / 60000)}分`}）`),

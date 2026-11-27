@@ -212,8 +212,12 @@ export const hasClips = visitId => [...index.values()].some(c => c.visitId === v
 
 /* ---------- 録音 ---------- */
 // 録音の状態は、ここで持つ（画面は描き直されるので、DOM には置かない）。一度に録音できるのは1つの来院だけ
-export const rec = { visitId: null, startedAt: 0, seq: 0, saving: 0 };
+// gaps：今回の録音で、音が録れていなかったあいだ（{ at: 始まった時刻 ms, sec: 秒 }）。gapOpen：いま録れていない。
+// stuck：画面に戻って5秒たっても、マイクが止まったまま（画面で、録音のやり直しをすすめる）
+export const rec = { visitId: null, startedAt: 0, seq: 0, saving: 0, gaps: [], gapOpen: false, stuck: false };
 let stream = null, mr = null, segTimer = null, wake = null, fakeCtx = null, onChange = () => {}, segMs = SEGMENT_SEC * 1000, stopping = null, mimeType = '';
+// 録れていないあいだを見つけるための状態（下の「録れていないあいだ」）
+let beat = null, lastTick = 0, lastHidden = false, visibleSince = 0, gapStart = 0, curGaps = [], carry = [], lastClip = null, fakeMuted = false, canSleep = false;
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
 export const isRecording = id => !!rec.visitId && (id == null || rec.visitId === id);
 export const elapsed = () => (rec.visitId ? Date.now() - rec.startedAt : 0);
@@ -227,19 +231,64 @@ async function keepAwake() {
 }
 document.addEventListener('visibilitychange', () => { if (rec.visitId && document.visibilityState === 'visible') keepAwake(); });
 
+/* ---------- 録れていないあいだ ---------- */
+// iPad では、アプリを画面から隠すと、マイクが止められ（track が muted になる）、ページごと止まることもある。
+// 隠しているあいだは録れないので、その時間を記録に残す。手がかりは2つ：
+// ・マイクの muted（mute / unmute の知らせと、確かめたときの track.muted）
+// ・1秒ごとの見回り。前の見回りから15秒以上あいていて、そのとき画面が隠れていた（か、隠れたところから戻った）なら、ページが止まっていたとみなす
+// 見回りのほうは、指でさわる端末（iPad・iPhone）だけで使う。パソコンのブラウザは、隠れたタブの見回りを遅らせるだけで、録音は続いているため。
+// 2つが重なっても、1回隠していたあいだは1つにまとめる（始まりは早いほうにする）。3秒に満たないものは数えない。
+const muted = () => fakeMuted || (stream ? stream.getAudioTracks().some(t => t.muted) : false);
+// 録れていないあいだは、それが終わった1本に入れる（区切りをまたいでも切らないので、1回隠していたあいだは1行になり、秒数も二重にならない）
+function addGap(start, end) {
+  if (end - start < 3000) return null;
+  const g = { at: start, sec: Math.round((end - start) / 1000) };
+  rec.gaps.push(g); curGaps.push(g);
+  return g;
+}
+function check(back = false) {
+  if (!rec.visitId) return;
+  const now = Date.now(), prev = lastTick, wasHidden = lastHidden;
+  const hidden = document.visibilityState === 'hidden';
+  lastTick = now; lastHidden = hidden;
+  if (hidden) visibleSince = 0; else if (!visibleSince) visibleSince = now;
+  let start = gapStart, closed = null;
+  if (canSleep && prev && now - prev >= 15000 && (wasHidden || back)) start = start ? Math.min(start, prev) : prev;
+  if (muted()) { if (!start) start = now; gapStart = start; }
+  else { gapStart = 0; if (start) closed = addGap(start, now); }
+  const stuck = !!gapStart && !!visibleSince && now - visibleSince > 5000;
+  const changed = rec.gapOpen !== !!gapStart || rec.stuck !== stuck;
+  rec.gapOpen = !!gapStart; rec.stuck = stuck;
+  if (closed) onChange({ gap: closed });
+  else if (changed) onChange({});
+}
+const onVis = () => check(document.visibilityState === 'visible');
+const onMute = () => check();
+// 録音を止めるときに、開いたままのあいだを、いま閉じる（最後の1本に入る）
+function closeOpenGap() {
+  if (gapStart) addGap(gapStart, Date.now());
+  gapStart = 0;
+}
+
 // 1本ぶんのレコーダーを作って始める。止まったら、その1本をすぐ保存する
 function startOne() {
   const opts = { audioBitsPerSecond: 32000 };
   if (mimeType) opts.mimeType = mimeType;
   const r = new MediaRecorder(stream, opts);
   const chunks = [], t0 = Date.now(), visitId = rec.visitId, seq = rec.seq++;
+  const myGaps = curGaps = [];       // この1本のあいだに終わった「録れていないあいだ」
   r.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
   r.onstop = () => {
     const dur = Date.now() - t0;
-    if (!chunks.length || dur < 800) return;           // 1秒に満たない切れ端は残さない
+    // 1秒に満たない切れ端は残さない（録れていないあいだは、次の1本か、最後に保存した1本に回す）
+    if (!chunks.length || dur < 800) { carry.push(...myGaps); return; }
     const type = r.mimeType || mimeType || chunks[0].type || 'audio/mp4';
+    const gaps = [...carry.splice(0), ...myGaps].map(g => ({ ...g }));
+    const clip = { id: uid(), visitId, seq, blob: new Blob(chunks, { type }), mime: type, created: t0, dur };
+    if (gaps.length) clip.gaps = gaps;
+    lastClip = clip;
     rec.saving++;
-    const p = putClip({ id: uid(), visitId, seq, blob: new Blob(chunks, { type }), mime: type, created: t0, dur })
+    const p = putClip(clip)
       .catch(e => { console.error(e); onChange({ error: 'save' }); })
       .finally(() => { rec.saving--; onChange({}); });
     saves.push(p);
@@ -300,14 +349,29 @@ export async function startRec(visitId, opts = {}) {
   }
   mimeType = pickMime();
   rec.visitId = visitId; rec.startedAt = Date.now(); rec.seq = 0; saves = [];
-  for (const t of stream.getAudioTracks()) t.onended = () => finish('ended');
+  rec.gaps = []; rec.gapOpen = false; rec.stuck = false;
+  gapStart = 0; carry = []; lastClip = null; fakeMuted = false; canSleep = navigator.maxTouchPoints > 1 || !!opts.fakeMic;
+  lastTick = Date.now(); lastHidden = document.visibilityState === 'hidden'; visibleSince = lastHidden ? 0 : lastTick;
+  for (const t of stream.getAudioTracks()) { t.onended = () => finish('ended'); t.onmute = onMute; t.onunmute = onMute; }
+  document.addEventListener('visibilitychange', onVis);
+  beat = setInterval(() => check(), 1000);
+  // 動作確認用（?mock のにせのマイクのときだけ）：N 秒のあいだマイクが止まっていたことにする。open を付けると、止まったままにする
+  if (opts.fakeMic) window.__recGap = (sec, open) => {
+    fakeMuted = true; check();
+    if (gapStart) gapStart = Math.min(gapStart, Date.now() - (Number(sec) || 0) * 1000);
+    if (!open) { fakeMuted = false; check(); }
+  };
   try { startOne(); } catch (e) { cleanup(); throw e; }
   keepAwake();
   onChange({});
 }
 function cleanup() {
   clearTimeout(segTimer); segTimer = null;
-  if (stream) for (const t of stream.getTracks()) { t.onended = null; t.stop(); }
+  clearInterval(beat); beat = null;
+  document.removeEventListener('visibilitychange', onVis);
+  delete window.__recGap;
+  fakeMuted = false;
+  if (stream) for (const t of stream.getTracks()) { t.onended = null; t.onmute = null; t.onunmute = null; t.stop(); }
   stream = null; mr = null;
   if (fakeCtx) { fakeCtx.close().catch(() => {}); fakeCtx = null; }
   if (wake) { wake.release().catch(() => {}); wake = null; }
@@ -320,13 +384,21 @@ async function finish(why) {
   stopping = (async () => {
     const last = mr;
     clearTimeout(segTimer);
+    clearInterval(beat); beat = null;     // 止めているあいだに、見回りが新しいあいだを開かないように
+    closeOpenGap();          // 止めるときに開いたままのあいだは、ここで閉じて、最後の1本に入れる
     if (last && last.state !== 'inactive') {
       // 止まった知らせが来ないときも、3秒であきらめて先へ進む（画面が止まらないように）
       await new Promise(res => { last.addEventListener('stop', () => setTimeout(res, 0), { once: true }); setTimeout(res, 3000); try { last.stop(); } catch (e) { res(); } });
     }
     cleanup();
     await Promise.allSettled(saves);
-    rec.visitId = null; rec.startedAt = 0;
+    // 最後の切れ端が短くて捨てた場合、その録れていないあいだは、最後に保存した1本に足す
+    if (carry.length && lastClip) {
+      lastClip.gaps = [...(lastClip.gaps || []), ...carry.splice(0).map(g => ({ ...g }))];
+      try { await putClip(lastClip); } catch (e) { console.error(e); }
+    }
+    carry = []; gapStart = 0;
+    rec.visitId = null; rec.startedAt = 0; rec.gapOpen = false; rec.stuck = false;
     stopping = null;
     const out = { visitId, startedAt, why };
     onChange(why ? { stopped: out } : {});
