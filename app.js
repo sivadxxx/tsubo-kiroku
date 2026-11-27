@@ -3,8 +3,10 @@ import { openStore } from './store.js';
 import { EFFECTS, effectMark, flatten, aggregate, sortAgg } from './stats.js';
 import { createCloud, explain } from './cloud-firebase.js';
 import { firebaseConfig } from './config.js';
+import * as ms from './monshin.js';
+import { makePdf } from './pdf.js';
 
-const VERSION = '1.10';
+const VERSION = '1.11';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -97,7 +99,8 @@ const curPlace = () => db.places.get(metaGet('place')) || places()[0];
 function fixRows(v) {
   for (const r of v.rows) if (!v.symptoms.includes(r.symptomId)) r.symptomId = v.symptoms[0] || null;
 }
-const isEmptyVisit = v => v.rows.length === 0 && !(v.memo || '').trim();
+// 問診の記録（talk）がある・録音中・まだ文字にしていない録音がある来院は、空ではない（自動で消さない）
+const isEmptyVisit = v => v.rows.length === 0 && !(v.memo || '').trim() && !v.talk && !ms.isRecording(v.id) && !ms.hasClips(v.id) && !talkJobs.has(v.id);
 
 /* ---------- 重ねて出す画面 ---------- */
 function openDialog({ title, body, footer, full, onClose }) {
@@ -226,6 +229,7 @@ async function render() {
   for (const a of document.querySelectorAll('#tabs a')) a.dataset.tab === tab ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current');
   lastRoute = r.key;
   window.scrollTo(0, y);
+  updateRecUi();
 }
 const topbar = (title, back, sub, right) => h('div', { class: 'top' },
   back ? h('button', { class: 'btn icon', 'aria-label': '戻る', onclick: () => go(back) }, '‹') : null,
@@ -310,7 +314,7 @@ function editPatient(p) {
         const n = visitsOf(p.id).length;
         if (!await confirmDialog(`${patientName(p)} を削除します。${n ? `\nこの患者の記録 ${n} 回分も消え、元に戻せません。` : ''}`, '削除する', true)) return;
         try { await store.delMany({ patients: [p.id], visits: visitsOf(p.id).map(v => v.id) }); } catch (e) { console.error(e); toast('削除できませんでした'); return; }
-        for (const v of visitsOf(p.id)) db.visits.delete(v.id);
+        for (const v of visitsOf(p.id)) { await dropClips(v.id); db.visits.delete(v.id); }
         db.patients.delete(p.id);
         removed = true; dlg.close();
       } }, 'この患者を削除'),
@@ -371,7 +375,8 @@ function viewPatient(id) {
     h('button', { class: 'btn primary big', onclick: start }, vs.some(x => x.date === today()) ? '今日の記録を開く' : '＋ 今日の施術を記録'),
     h('h2', null, `これまでの記録（${vs.length}回）`),
     vs.length ? h('ul', { class: 'list' }, vs.map((v, i) => h('li', null, h('button', { class: 'item', onclick: () => go('#/v/' + v.id) },
-      h('span', { class: 'ttl' }, fmtDate(v.date), h('small', null, `${i + 1}回目` + (db.staff.has(v.staffId) ? `・担当 ${staffName(v.staffId)}` : '')), v.symptoms.map(s => h('span', { class: 'tag' }, symptomName(s)))),
+      h('span', { class: 'ttl' }, fmtDate(v.date), h('small', null, `${i + 1}回目` + (db.staff.has(v.staffId) ? `・担当 ${staffName(v.staffId)}` : '')), v.symptoms.map(s => h('span', { class: 'tag' }, symptomName(s))),
+        v.talk ? h('span', { class: 'tag talk' }, '問診') : ms.hasClips(v.id) ? h('span', { class: 'tag talk' }, '未処理の録音') : null),
       h('span', { class: 'marks' }, v.rows.length ? v.rows.map(r => h('span', null, tsuboName(r.tsuboId), sideLabel(r.side) === '中' ? '' : ' ' + sideLabel(r.side), r.effect != null ? [' ', h('b', null, effectMark(r.effect))] : '')) : h('span', { class: 'sub' }, 'ツボの記録なし')),
       v.memo ? h('span', { class: 'sub' }, v.memo) : null))).reverse())
       : h('p', { class: 'empty' }, 'まだ記録がありません。'),
@@ -423,6 +428,7 @@ function viewVisit(id) {
     topbar(patientName(p), '#/p/' + v.patientId, `${n}回目`),
     h('input', { type: 'date', 'aria-label': '日付', value: v.date, onchange: e => { if (e.target.value) { v.date = e.target.value; change(); } } }),
     staffEl,
+    talkCard(v, p, n),
     h('div', { class: 'card' },
       h('h2', null, '今日みる症状'),
       v.symptoms.length ? h('div', { class: 'chips' }, v.symptoms.map(s => h('span', { class: 'tag', style: 'font-size:14px;padding:4px 12px' }, symptomName(s)))) : h('p', { class: 'sub' }, '症状を選んでおくと、あとで「症状ごとの効いたツボ」が集計できます。'),
@@ -441,10 +447,220 @@ function viewVisit(id) {
       h('textarea', { value: v.memo || '', placeholder: '気づいたこと（手書きのメモは GoodNotes へ）', oninput: e => { v.memo = e.target.value; saveSoon(); }, onchange: e => { v.memo = e.target.value; save(); } })),
     h('button', { class: 'btn danger small', style: 'align-self:flex-start', onclick: async () => {
       if (!await confirmDialog(`${fmtDate(v.date)} の記録を削除します。元に戻せません。`, '削除する', true)) return;
+      await dropClips(v.id);
       await del('visits', v.id); go('#/p/' + v.patientId);
     } }, 'この日の記録を削除'),
     aimList,
   ];
+}
+
+/* ---------- 問診の録音 ---------- */
+// 録音と OpenAI への問い合わせは monshin.js。ここでは、画面と、来院の記録（visit.talk）への保存を受け持つ。
+// visit.talk = { summary: まとめ, transcript: 文字起こしの全文, at: 最後に作った時刻 }
+const urlParams = new URLSearchParams(location.search);
+const isMock = ['localhost', '127.0.0.1'].includes(location.hostname) && urlParams.has('mock');      // 動作確認用（にせの AI・にせのマイク）
+const talkJobs = new Map();      // 来院の id → 文字起こし・まとめの途中（{ step: 'tr', i, n } か { step: 'sum' }）
+const talkErrs = new Map();      // 来院の id → うまくいかなかった理由（AiError）
+const talkNote = new Map();      // 来院の id → 録音を始められなかった・途中で止まったときの知らせ
+let talkStarting = null;         // マイクの許可を待っている来院の id
+const talkOpen = new Set();      // 「文字起こしの全文」を開いている来院の id（描き直しても閉じないように）
+const aiKey = () => metaGet('aiKey') || '';
+const aiModel = () => (ms.MODELS.some(m => m.id === metaGet('aiModel')) ? metaGet('aiModel') : ms.MODELS[0].id);
+const aiPrompt = () => metaGet('aiPrompt') || ms.DEFAULT_PROMPT;
+// 聞き間違いを直す手がかり：登録されている症状とツボの名前（患者に関することは渡さない）
+const aiTerms = () => ({ symptoms: activeSymptoms().sort(byOrder(byCreated)).map(s => s.name), tsubo: activeTsubo().sort(tsuboOrder).map(t => t.name) });
+const mmss = t => { const s = Math.floor(t / 1000); return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`; };
+const hhmm = t => { const d = new Date(t); return `${d.getHours()}:${pad(d.getMinutes())}`; };
+const longDate = s => { const [y, m, d] = s.split('-').map(Number); return `${y}年${m}月${d}日（${'日月火水木金土'[new Date(y, m - 1, d).getDay()]}）`; };
+function refresh() { remoteChanged(); updateRecUi(); }
+// 文字の量に合わせて、入力欄の高さを広げる
+function grow(ta) { ta.style.height = 'auto'; ta.style.height = Math.max(180, ta.scrollHeight + 4) + 'px'; }
+
+// 来院の記録を消すときに、その来院の録音も消す
+async function dropClips(visitId) {
+  if (ms.isRecording(visitId)) await ms.cancelRec();
+  try { await ms.deleteClips(visitId); } catch (e) { console.error(e); }
+  talkErrs.delete(visitId); talkNote.delete(visitId);
+}
+// 録音の状態が変わった（区切りを保存した・途中で止まった など）
+function recChanged(e) {
+  if (e.error === 'save') toast('録音を保存できませんでした。端末の空きを確かめてください');
+  if (e.stopped) {
+    const t = e.stopped.why === 'ended' ? 'マイクが止まったため、録音を終えました。そこまでの分は残してあります。' : '録音が途中で止まりました。そこまでの分は残してあります。';
+    talkNote.set(e.stopped.visitId, t); toast(t);
+  }
+  refresh();
+}
+async function startTalk(v) {
+  if (ms.isRecording()) { toast('ほかの来院で録音中です'); return; }
+  if (!metaGet('aiConsent')) {
+    if (!await confirmDialog('会話は、文字にしてまとめるために OpenAI に送られます。患者さんの同意を得てから始めてください。', '同意を得たので始める')) return;
+    await metaSet('aiConsent', true);
+  }
+  if (v.talk && !await confirmDialog('続きを録音すると、文字起こしは前の全文のあとに足し、まとめは全文から作り直します。手で直したまとめの内容は消えます。', '続きを録音する')) return;
+  talkNote.delete(v.id); talkErrs.delete(v.id);
+  talkStarting = v.id; refresh();
+  try {
+    await ms.startRec(v.id, { onChange: recChanged, segSec: (isMock && Number(urlParams.get('seg'))) || undefined, fakeMic: isMock });
+  } catch (e) {
+    console.error(e);
+    const t = e.name === 'NotAllowedError' || e.name === 'SecurityError' ? 'マイクを使う許可がありません。iPad の「設定」で、Safari（またはこのアプリ）のマイクを許可してください。'
+      : e.name === 'NotFoundError' || e.name === 'OverconstrainedError' ? 'マイクが見つかりません。'
+      : e.message === 'unsupported' ? 'この端末（ブラウザ）では録音できません。'
+      : '録音を始められませんでした。もう一度ためしてください。';
+    talkNote.set(v.id, t); toast(t);
+  }
+  talkStarting = null;
+  refresh();
+}
+async function stopTalk(id) { await ms.stopRec(); refresh(); processTalk(id); }
+async function cancelTalk() {
+  if (!await confirmDialog('いまの録音を捨てます。元に戻せません。', '捨てる', true)) return;
+  await ms.cancelRec(); refresh();
+}
+// 来院の記録を、待たずに確かめて保存する（失敗したら録音を消さないため）
+async function saveVisitNow(v) {
+  v.updated = Date.now();
+  db.visits.set(v.id, v);
+  await store.put('visits', v);
+}
+// 残っている録音を文字にして、まとめを作り、来院の記録に入れる。うまくいったら、その来院の録音を消す（失敗したら残す）
+async function processTalk(id) {
+  if (talkJobs.has(id)) return;
+  const key = aiKey();
+  talkErrs.delete(id); talkNote.delete(id);
+  if (!key) { talkErrs.set(id, new ms.AiError('key')); refresh(); return; }
+  try {
+    const clips = await ms.clipsOf(id);
+    if (!clips.length) return;
+    for (let i = 0; i < clips.length; i++) {
+      talkJobs.set(id, { step: 'tr', i: i + 1, n: clips.length }); refresh();
+      const c = clips[i];
+      // 文字にできた分は録音といっしょに覚えておき、やり直すときに二重に払わない
+      if (typeof c.text !== 'string') { c.text = await ms.transcribe(c.blob, { key, mime: c.mime, terms: aiTerms() }); await ms.putClip(c); }
+    }
+    const added = clips.map(c => c.text).filter(t => t.trim()).join('\n');
+    let v = db.visits.get(id);
+    if (!v) return;                    // その来院の記録が消された
+    const old = v.talk || null;
+    if (!added) {
+      await ms.deleteClips(id);
+      toast(old ? '会話が聞き取れなかったので、まとめはそのままです' : '会話が聞き取れませんでした');
+      return;
+    }
+    const sep = `\n\n――― 続きの録音（${hhmm(clips[0].created)}）―――\n\n`;
+    const transcript = old && old.transcript ? old.transcript + sep + added : added;
+    // 全文を消してあるときは、前のまとめを手がかりに足して作る
+    const input = old && !old.transcript && old.summary ? `（前の録音のまとめ。全文は消してあります）\n${old.summary}${sep}${added}` : transcript;
+    talkJobs.set(id, { step: 'sum' }); refresh();
+    const summary = await ms.summarize(input, { key, model: aiModel(), prompt: aiPrompt(), terms: aiTerms() });
+    v = db.visits.get(id);
+    if (!v) return;
+    v.talk = { summary, transcript, at: Date.now() };
+    await saveVisitNow(v);
+    await ms.deleteClips(id);
+    toast('問診のまとめができました');
+  } catch (e) {
+    console.error(e instanceof ms.AiError ? `問診の録音：${e.code} ${e.detail}` : e);
+    talkErrs.set(id, e instanceof ms.AiError ? e : new ms.AiError('other', '保存できませんでした'));
+  } finally { talkJobs.delete(id); refresh(); }
+}
+async function resummarize(id) {
+  const v = db.visits.get(id);
+  if (!v || !v.talk || !v.talk.transcript || talkJobs.has(id)) return;
+  if (!await confirmDialog('文字起こしの全文から、まとめを作り直します。手で直した内容は消えます。', '作り直す')) return;
+  talkJobs.set(id, { step: 'sum' }); refresh();
+  try {
+    const summary = await ms.summarize(v.talk.transcript, { key: aiKey(), model: aiModel(), prompt: aiPrompt(), terms: aiTerms() });
+    const cur = db.visits.get(id);
+    if (cur && cur.talk) { cur.talk = { ...cur.talk, summary, at: Date.now() }; await put('visits', cur); toast('まとめなおしました'); }
+  } catch (e) { console.error(`問診の録音：${e.code || ''}`); toast(ms.explainAi(e)); }
+  finally { talkJobs.delete(id); refresh(); }
+}
+async function sendPdf(v, p, n) {
+  const t = v.talk;
+  if (!t || !(t.summary || '').trim()) { toast('まとめが空です'); return; }
+  let pdf;
+  try { pdf = await makePdf({ title: '問診のまとめ', meta: [longDate(v.date), `${patientName(p)}・${n}回目`], body: t.summary }); }
+  catch (e) { console.error(e); toast('PDF を作れませんでした'); return; }
+  if (isMock) window.__lastPdf = pdf;         // 動作確認用
+  await saveFile(`問診_${v.date.replace(/-/g, '')}.pdf`, pdf.blob, 'application/pdf');
+}
+function talkCard(v, p, n) {
+  const key = aiKey(), job = talkJobs.get(v.id), pend = ms.pendingOf(v.id), err = talkErrs.get(v.id), note = talkNote.get(v.id);
+  const here = ms.isRecording(v.id), other = ms.isRecording() && !here;
+  const save = () => put('visits', v), saveSoon = debounce(save, 500);
+  const toSettings = h('button', { class: 'btn', style: 'align-self:flex-start', onclick: () => go('#/settings') }, '設定をひらく');
+  const out = [h('h2', null, '問診の録音')];
+  if (here) out.push(
+    h('div', { class: 'rec-now' }, h('span', { class: 'rec-dot', 'aria-hidden': 'true' }), '録音中', h('span', { 'data-rec-time': '' }, mmss(ms.elapsed()))),
+    h('button', { class: 'btn primary big', onclick: () => stopTalk(v.id) }, '■ 止めてまとめる'),
+    h('button', { class: 'btn small danger', style: 'align-self:flex-start', onclick: cancelTalk }, '取り消す'),
+    h('p', { class: 'sub' }, '録音中も、ツボ選びなどの入力や、ほかの画面への移動ができます。'));
+  else if (job) out.push(h('p', { class: 'talk-busy' }, job.step === 'tr' ? `文字にしています…（${job.i}/${job.n}）` : 'まとめています…'), h('p', { class: 'sub' }, 'このあいだも、ほかの入力ができます。'));
+  else if (pend.n) out.push(
+    h('p', null, `まだ文字にしていない録音があります（${pend.n}本・${pend.ms < 60000 ? '1分未満' : `約${Math.round(pend.ms / 60000)}分`}）`),
+    err ? h('p', { style: 'color:var(--danger)' }, ms.explainAi(err)) : note ? h('p', { class: 'sub' }, note) : null,
+    !key && !(err && err.code === 'key') ? h('p', { class: 'sub' }, '「設定」で OpenAI の API キーを入れると、文字にしてまとめられます。') : null,
+    !key ? toSettings : null,
+    h('div', { class: 'row wrap' },
+      h('button', { class: 'btn primary', disabled: !key, onclick: () => processTalk(v.id) }, err ? 'もう一度ためす' : '文字にしてまとめる'),
+      h('button', { class: 'btn danger', onclick: async () => {
+        if (!await confirmDialog(`まだ文字にしていない録音（${pend.n}本）を捨てます。元に戻せません。`, '捨てる', true)) return;
+        await dropClips(v.id); refresh();
+      } }, '録音を捨てる')));
+
+  const t = v.talk;
+  if (t) {
+    const ta = h('textarea', { class: 'talk', value: t.summary || '', 'aria-label': '問診のまとめ', oninput: e => { t.summary = e.target.value; grow(e.target); saveSoon(); }, onchange: e => { t.summary = e.target.value; save(); } });
+    requestAnimationFrame(() => { if (ta.isConnected) grow(ta); });
+    out.push(
+      h('p', { class: 'sub' }, `まとめ（${hhmm(t.at)} 作成。直すと、そのまま保存されます）`),
+      ta,
+      h('div', { class: 'row wrap' },
+        h('button', { class: 'btn primary', onclick: () => sendPdf(v, p, n) }, 'GoodNotes へ送る'),
+        h('button', { class: 'btn', onclick: async () => {
+          try { await navigator.clipboard.writeText(t.summary || ''); toast('まとめをコピーしました'); } catch (e) { toast('コピーできませんでした'); }
+        } }, 'コピー'),
+        h('button', { class: 'btn', disabled: !key || !t.transcript || !!job || here, onclick: () => resummarize(v.id) }, 'まとめなおす')),
+      h('details', { class: 'talk-all', open: talkOpen.has(v.id), ontoggle: e => { if (e.target.open) talkOpen.add(v.id); else talkOpen.delete(v.id); } },
+        h('summary', null, '文字起こしの全文'),
+        t.transcript ? [h('div', { class: 'transcript' }, t.transcript),
+          h('button', { class: 'btn small danger', onclick: async () => {
+            if (!await confirmDialog('文字起こしの全文を消します。まとめは残ります。元に戻せません。', '全文を消す', true)) return;
+            const cur = db.visits.get(v.id); if (!cur || !cur.talk) return;
+            cur.talk = { ...cur.talk, transcript: '' }; await put('visits', cur); render();
+          } }, '全文を消す')]
+          : h('p', { class: 'sub' }, '全文は消してあります。'),
+      ),
+      h('button', { class: 'btn small danger', style: 'align-self:flex-start', disabled: !!job, onclick: async () => {
+        if (!await confirmDialog('この来院の問診の記録（まとめと全文）を消します。元に戻せません。', '消す', true)) return;
+        const cur = db.visits.get(v.id); if (!cur) return;
+        delete cur.talk; await put('visits', cur); render();
+      } }, '問診の記録を消す'));
+  }
+  if (!here && !job && !pend.n) {
+    if (!key) out.push(h('p', { class: 'sub' }, '設定で OpenAI の API キーを入れると、問診を録音して文章にまとめられます。'), toSettings);
+    else if (other) out.push(h('p', { class: 'sub' }, 'ほかの来院で録音しています。一度に録音できるのは1つの来院だけです。'), h('button', { class: 'btn', style: 'align-self:flex-start', onclick: () => go('#/v/' + ms.rec.visitId) }, '録音中の記録へ'));
+    else if (talkStarting) out.push(h('p', { class: 'sub' }, 'マイクを準備しています…（許可を聞かれたら「許可」を押してください）'));
+    else out.push(
+      note ? h('p', { style: 'color:var(--danger)' }, note) : null,
+      h('button', { class: t ? 'btn' : 'btn big', style: t ? 'align-self:flex-start' : '', onclick: () => startTalk(v) }, h('span', { class: 'rec-dot', 'aria-hidden': 'true' }), t ? '続きを録音する' : '録音を始める'));
+  }
+  return h('div', { class: 'card' }, out);
+}
+// 録音中にほかの画面へ移ったときの帯と、経過時間の表示（画面を描き直さず、その文字だけを書き換える）
+let recTick = null;
+function updateRecUi() {
+  const on = ms.isRecording(), r = parseRoute();
+  const away = on && !(r.name === 'v' && r.arg === ms.rec.visitId);
+  const bar = $('#recbar');
+  if (bar) bar.hidden = !away;
+  document.body.classList.toggle('recbar', away);
+  const t = mmss(ms.elapsed());
+  for (const el of document.querySelectorAll('[data-rec-time]')) el.textContent = t;
+  if (on && !recTick) recTick = setInterval(updateRecUi, 500);
+  if (!on && recTick) { clearInterval(recTick); recTick = null; }
 }
 
 // 来院の記録の画面から、担当者をその場で足す（足した人が、この記録の担当者になる）
@@ -806,16 +1022,35 @@ function bulkAdd(kind) {
 }
 
 /* ---------- 控え（バックアップ・書き出し） ---------- */
-async function saveFile(name, text, type) {
-  const file = new File([text], name, { type });
-  // iPad では共有の画面（「ファイルに保存」など）を出す。パソコンではそのままダウンロードする
+// data は、文字列でも Blob（PDF など）でもよい
+async function saveFile(name, data, type) {
+  const file = new File([data], name, { type: type || data.type || '' });
+  // iPad では共有の画面（「ファイルに保存」・GoodNotes など）を出す。パソコンではそのままダウンロードする
   if (navigator.maxTouchPoints > 0 && navigator.canShare && navigator.canShare({ files: [file] })) {
-    try { await navigator.share({ files: [file] }); return true; } catch (e) { if (e.name === 'AbortError') return false; }
+    try { await navigator.share({ files: [file] }); return true; } catch (e) {
+      if (e.name === 'AbortError') return false;
+      // ファイルを作るのに時間がかかり、押したことが切れてしまった：もう一度押してもらって共有の画面を出す
+      if (e.name === 'NotAllowedError') return shareLater(file);
+    }
   }
   const a = h('a', { href: URL.createObjectURL(file), download: name });
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   return true;
+}
+function shareLater(file) {
+  return new Promise(res => {
+    let ok = false;
+    const dlg = openDialog({
+      title: 'ファイルができました',
+      body: h('p', null, `${file.name} ができました。下のボタンで、共有の画面を出します。`),
+      footer: [h('button', { class: 'btn', onclick: () => dlg.close() }, 'やめる'), h('button', { class: 'btn primary', onclick: async () => {
+        try { await navigator.share({ files: [file] }); ok = true; } catch (e) {}
+        dlg.close();
+      } }, '共有の画面を出す')],
+      onClose: () => res(ok),
+    });
+  });
 }
 const stamp = () => today().replace(/-/g, '');
 function toCsv() {
@@ -861,8 +1096,58 @@ function viewSettings() {
       h('h2', null, '表計算ソフト用（CSV）'),
       h('p', null, 'ツボ1つを1行にした一覧です。Excel や Numbers で、自由に集計できます。'),
       h('button', { class: 'btn', disabled: !db.visits.size, onclick: () => saveFile(`ツボ記録-${stamp()}.csv`, toCsv(), 'text/csv') }, 'CSV を書き出す')),
+    aiCard(),
     h('p', { class: 'sub' }, `患者 ${db.patients.size}人・来院 ${db.visits.size}回・ツボ ${db.tsubo.size}個・症状 ${db.symptoms.size}個　／　ツボ記録 ${VERSION}`),
   ];
+}
+
+// 問診の録音（AI）の設定。キー・AI・まとめ方は端末ごとの設定（meta）で、クラウドにも控えにも入らない
+function aiCard() {
+  const saved = aiKey();
+  const keyIn = h('input', { type: 'password', autocomplete: 'off', autocapitalize: 'off', spellcheck: false, 'aria-label': 'OpenAI の API キー', placeholder: saved ? '別のキーに替えるときだけ入れる' : 'API キー（sk- で始まる）' });
+  const msg = h('p', { class: 'sub', hidden: true, role: 'status' });
+  const say = (t, bad) => { msg.textContent = t; msg.style.color = bad ? 'var(--danger)' : ''; msg.hidden = false; };
+  const saveKey = async () => {
+    const k = keyIn.value.trim();
+    if (!k) { toast('キーを入れてください'); return; }
+    if (/\s/.test(k)) { toast('キーに空白が入っています。コピーしなおしてください'); return; }
+    await metaSet('aiKey', k);
+    keyIn.value = '';
+    toast('キーを保存しました'); render();
+  };
+  keyIn.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) saveKey(); });
+  const testBtn = h('button', { class: 'btn', onclick: async () => {
+    const k = keyIn.value.trim() || aiKey();
+    if (!k) { toast('キーを入れてください'); return; }
+    testBtn.disabled = true; say('確かめています…');
+    try { await ms.checkKey(k, aiModel()); say(keyIn.value.trim() ? 'つながりました。「保存」を押すと、このキーを使います。' : 'つながりました。このキーで使えます。'); }
+    catch (e) { say(ms.explainAi(e), true); }
+    testBtn.disabled = false;
+  } }, 'つながるか試す');
+  const model = h('select', { 'aria-label': '整理に使う AI', onchange: e => metaSet('aiModel', e.target.value) }, ms.MODELS.map(m => h('option', { value: m.id, selected: m.id === aiModel() }, m.label)));
+  const prompt = h('textarea', { class: 'talk', value: aiPrompt(), 'aria-label': 'まとめ方の指示' });
+  const savePrompt = debounce(() => { const t = prompt.value.trim(); metaSet('aiPrompt', !t || t === ms.DEFAULT_PROMPT ? null : prompt.value); }, 500);
+  prompt.addEventListener('input', () => { grow(prompt); savePrompt(); });
+  requestAnimationFrame(() => { if (prompt.isConnected) grow(prompt); });
+  return h('div', { class: 'card' },
+    h('h2', null, '問診の録音（AI）'),
+    h('p', null, '問診の会話を録音して、OpenAI の AI で文字にし、見出しごとに整理します。使うには、OpenAI の API キーが要ります。'),
+    saved ? h('div', { class: 'row wrap' }, h('span', { class: 'grow' }, `キー：保存済み（末尾 ${saved.slice(-4)}）`),
+      h('button', { class: 'btn small danger', onclick: async () => {
+        if (!await confirmDialog('この端末に保存した API キーを消します。', '消す', true)) return;
+        await del('meta', 'aiKey'); render();
+      } }, '消す')) : null,
+    h('div', { class: 'row' }, h('div', { class: 'grow' }, keyIn), h('button', { class: 'btn primary', onclick: saveKey }, '保存')),
+    h('div', { class: 'row wrap' }, testBtn), msg,
+    h('label', { class: 'f' }, '整理に使う AI', model),
+    h('label', { class: 'f' }, 'まとめ方の指示（AI に渡す文）', prompt),
+    h('button', { class: 'btn small', style: 'align-self:flex-start', onclick: async () => {
+      if (!await confirmDialog('まとめ方の指示を、はじめの文にもどします。', 'もどす')) return;
+      await metaSet('aiPrompt', null); render();
+    } }, 'はじめの指示にもどす'),
+    h('p', { class: 'sub' }, 'キーは、この端末の中だけに保存され、クラウドや控え（バックアップ）には入りません。使う端末ごとに入れてください。'),
+    h('p', { class: 'sub' }, '費用の目安：10分の録音で 15円前後（OpenAI の利用料。整理に使う AI で変わります）。OpenAI の管理画面で、月の上限額を決めておくと安心です。'),
+    h('p', { class: 'sub' }, '録音は、文字にし終えるまでこの端末の中に置き、まとめを保存したら消します。音声は OpenAI に送るだけで、ほかには送りません。'));
 }
 
 /* ---------- 同期（クラウド） ---------- */
@@ -1027,7 +1312,12 @@ async function main() {
     }
     if (!db.places.size) await put('places', { id: uid(), name: '治療院', mode: 'no', created: Date.now() });
   };
+  // 問診の録音：文字にしていない録音の一覧を読む。動作確認のときは、にせの AI を使う
+  try { await ms.initClips(); } catch (e) { console.error(e); }
+  if (isMock) ms.setFetch((await import('./src/ai-mock.js')).mockFetch);
   window.addEventListener('hashchange', render);
+  window.addEventListener('beforeunload', e => { if (ms.isRecording()) { e.preventDefault(); e.returnValue = ''; } });      // 録音中に閉じかけたら、たずねる
+  $('#recbar').addEventListener('click', () => { if (ms.isRecording()) go('#/v/' + ms.rec.visitId); });
   document.addEventListener('focusout', () => setTimeout(() => { if (needRender && !busy()) render(); }, 150));
   if ('serviceWorker' in navigator && !isLocalhost) navigator.serviceWorker.register('sw.js').catch(() => {});
 

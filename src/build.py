@@ -51,7 +51,8 @@ manifest = {
 with open(os.path.join(APP, "manifest.webmanifest"), "w", encoding="utf-8") as f:
     json.dump(manifest, f, ensure_ascii=False, indent=1)
 
-ASSETS = ["index.html", "app.js", "store.js", "stats.js", "cloud-firebase.js", "config.js", "manifest.webmanifest", "icons/icon-180.png", "icons/icon-192.png", "icons/icon-512.png"]
+# src/ の中（にせのクラウド・にせの AI）は動作確認用なので、入れない
+ASSETS = ["index.html", "app.js", "store.js", "stats.js", "monshin.js", "pdf.js", "cloud-firebase.js", "config.js", "manifest.webmanifest", "icons/icon-180.png", "icons/icon-192.png", "icons/icon-512.png"]
 import re
 SDK_VERSION = re.search(r"SDK_VERSION = '([^']+)'", open(os.path.join(APP, "cloud-firebase.js"), encoding="utf-8").read()).group(1)
 SDK = ["https://www.gstatic.com/firebasejs/%s/firebase-%s.js" % (SDK_VERSION, n) for n in ("app", "auth", "firestore")]

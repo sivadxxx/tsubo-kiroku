@@ -20,7 +20,8 @@
   - `stats.js` 集計の計算だけ（画面に依存しない。`node` で単体で試せる）
   - `store.js` 端末の中への保存（IndexedDB、DB 名 `tsubo-kiroku`）
   - `cloud-firebase.js` ログインとクラウドへの保存、`config.js` Firebase の接続先（秘密の鍵ではない）
-  - `src/build.py` アイコン・`manifest.webmanifest`・`sw.js` を作る。`src/cloud-mock.js` は動作確認用のにせのクラウド
+  - `monshin.js` 問診の録音と OpenAI への問い合わせ、`pdf.js` まとめの PDF（下の「問診の録音」）
+  - `src/build.py` アイコン・`manifest.webmanifest`・`sw.js` を作る。`src/cloud-mock.js` は動作確認用のにせのクラウド、`src/ai-mock.js` はにせの AI（どちらもキャッシュに入れない）
 - 見た目：クリーム色の地にテラコッタのアクセント（`:root` の変数）。ほかのアプリ（ツボマップ3D・人体図）とそろえる。
 - 画面の文言とコードのコメント、コミットメッセージは、平易な日本語で書く。
 - **スマホ幅を先に考える**（iPad の Split View と iPhone で使うため）。押すところは 44px 以上。
@@ -40,6 +41,27 @@
 - 統計の「ツボランキング」は、ツボの行（`rows`）1つを1回と数える（同じ来院で左と右を別の行にすると2回）。
   期間は、こよみの区切り（その日・月曜からの1週間・その月・その年。`rankRange()`）。今日までの7日間などではない。
 - 効果は 3=◎ 2=○ 1=△ 0=×、未入力は `null`。「効いた」は ◎ と ○。割合は、効果を入れた回数に対するもの。
+
+## 問診の録音（AI）
+
+- `monshin.js`：録音（`getUserMedia` + `MediaRecorder`）と、OpenAI への問い合わせ（`transcribe`・`summarize`・`checkKey`）だけ。画面に依存しない。
+  AI は OpenAI だけ。ブラウザから `fetch` で直接呼ぶ（SDK なし）。整理を別の会社の AI に替えるときは `summarize` だけを差し替える。
+  `pdf.js`：まとめを A4 の PDF にする（canvas に描いて JPEG にし、自前で PDF を組み立てる）。
+- 文字起こしは `gpt-4o-transcribe-diarize`（`/v1/audio/transcriptions`、`response_format=diarized_json`、`chunking_strategy=auto`、`language=ja`）。
+  このモデルは `prompt`（用語のヒント）を受け付けないので、症状とツボの名前は、まとめのときに渡す。**OpenAI はこのモデルを 2027-02-26 に止める予定**。
+  止まったとき（モデルが使えないと返ってきたとき）は、`transcribe` が `gpt-transcribe`（`languages[]=ja`、症状とツボの名前を `keywords[]`、話者分けなし）で同じ録音をやり直し、
+  そのページを開いているあいだは最初から `gpt-transcribe` を使う（`console.info` に1行出すだけで、画面には出さない）。`?mock` でキーを `old…` にすると再現できる。
+  整理は `/v1/responses`（`instructions` + `input`、`store: false`）。答えの文は `output` の中の `message` → `output_text` にある（`output_text` という項目は SDK だけのもの）。
+- 来院の記録に `visit.talk = { summary, transcript, at }` を持つ（種類は増やしていないので `KINDS`/`VER` は変えていない）。`talk` があれば空の来院ではない。
+- 録音は、文字にし終えるまで、別の IndexedDB `tsubo-kiroku-rokuon`（ストア `clips`）に置く（ログイン中に差し替わる `store` は使わない）。
+  1本ずつ（数分ごとにレコーダーを作り直す）すぐ保存し、まとめを保存できたら、その来院の録音を消す。失敗したら残す。文字にできた分は `clip.text` に覚え、やり直しで二重に払わない。
+  録音中・未処理の録音がある来院も、空として自動では消さない。来院・患者を消すときは、その録音も消す。
+- 録音の状態は `monshin.js` のモジュール変数（`rec`）。経過時間は `[data-rec-time]` の文字だけを書き換える（`render()` しない）。録音中にほかの画面へ移ると `#recbar` が出る。
+- **API キーは `meta`（`aiKey`）だけ**。クラウド・控え・CSV・ログ・エラーの文に出さない（OpenAI の 401 の文にはキーの一部が入るので、画面には出さない）。
+  整理の AI は `aiModel`、まとめ方の指示は `aiPrompt`（なければ `DEFAULT_PROMPT`）、最初の同意の確認は `aiConsent`。
+- 動作確認：`http://localhost:8768/?mock&seg=3`。`?mock` のときだけ、にせの AI（`src/ai-mock.js`。monshin.js の `fetch` を差し替える）を使い、
+  マイクが使えなければにせの音で録音する。`seg=3` で区切りを3秒にする。キーが `fail…` で 401、`net…` で通信失敗、`limit…` で 429 を再現する。
+  本物の OpenAI には、キーがないので Claude からは試せない。本物での確認は、使う人に頼む。
 
 ## 保存と同期のしくみ
 
@@ -71,7 +93,7 @@
   「クラウド」の中身は localStorage にあり、別の文書（iframe や別タブ）から書き換えると、ほかの端末からの変化を再現できる。
 - **本物の Firebase には、Claude はログインできない**（パスワードを入力しない）。本物での確認は、使う人に頼む。
 - iPad の Split View 相当（幅 507px）と iPhone 相当（幅 375px）で、はみ出しがないかを見る。
-- 確認で入れたテストデータは、終わったら消す（IndexedDB の `tsubo-kiroku`、localStorage、sessionStorage）。
+- 確認で入れたテストデータは、終わったら消す（IndexedDB の `tsubo-kiroku` と `tsubo-kiroku-rokuon`、localStorage、sessionStorage）。
 
 ## 公開の流れ
 
