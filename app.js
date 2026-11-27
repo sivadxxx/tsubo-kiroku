@@ -6,7 +6,7 @@ import { firebaseConfig } from './config.js';
 import * as ms from './monshin.js';
 import { makePdf } from './pdf.js';
 
-const VERSION = '1.12';
+const VERSION = '1.13';
 // 最初から入れておく症状（問診票のチェック項目）。「リスト」でいつでも足せる・消せる
 const SEED_SYMPTOMS = ['肩こり', '首のこり', '頭痛', 'めまい', 'ほてり', '目の疲れ', '動悸', '息切れ', '鼻づまり', '倦怠感', '背中の痛み', '腕の痛み', '腰痛', '胃痛', '腹痛', '便秘', '下痢', '生理痛', '股関節痛', '膝痛', '足の痛み', '足のむくみ', '足の痺れ', '冷え性', '不眠'];
 const SIDES = [{ v: 'L', label: 'L' }, { v: 'R', label: 'R' }, { v: 'B', label: '両' }, { v: '', label: '中' }];
@@ -518,6 +518,10 @@ function viewVisit(id) {
 // visit.talk = { summary: まとめ, transcript: 文字起こしの全文, at: 最後に作った時刻 }
 const urlParams = new URLSearchParams(location.search);
 const isMock = ['localhost', '127.0.0.1'].includes(location.hostname) && urlParams.has('mock');      // 動作確認用（にせの AI・にせのマイク）
+// iPad のホーム画面アプリは、左上にウインドウのボタンが重なる（よける幅を教えてくれる仕組みが無い）。自分で見分けて、上のバーを右へよける
+const isIpadApp = (navigator.standalone === true || matchMedia('(display-mode: standalone)').matches)
+  && (/iPad/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+document.documentElement.classList.toggle('ipad-win', isIpadApp || (isMock && urlParams.has('ipadwin')));   // ?mock&ipadwin は動作確認用
 const talkJobs = new Map();      // 来院の id → 文字起こし・まとめの途中（{ step: 'tr', i, n } か { step: 'sum' }）
 const talkErrs = new Map();      // 来院の id → うまくいかなかった理由（AiError）
 const talkNote = new Map();      // 来院の id → 録音を始められなかった・途中で止まったときの知らせ
